@@ -1,0 +1,978 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SmartDoc AI – Demo</title>
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      :root {
+        --bg: #f5f5f4;
+        --sidebar: #1c1c1c;
+        --card: #ffffff;
+        --border: #e2e2e0;
+        --text: #1a1a1a;
+        --muted: #6b6b6b;
+        --accent: #2563eb;
+        --accent-light: #dbeafe;
+        --success: #16a34a;
+        --success-light: #dcfce7;
+        --error: #dc2626;
+        --user-bubble: #1c1c1c;
+        --bot-bubble: #ffffff;
+        --mono: "Courier New", monospace;
+      }
+
+      body {
+        font-family: "Segoe UI", system-ui, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        display: flex;
+        height: 100vh;
+        overflow: hidden;
+      }
+
+      /* ── SIDEBAR ── */
+      .sidebar {
+        width: 260px;
+        min-width: 260px;
+        background: var(--sidebar);
+        color: #e5e5e5;
+        display: flex;
+        flex-direction: column;
+        padding: 24px 20px;
+        gap: 20px;
+      }
+      .sidebar h2 {
+        font-size: 15px;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        color: #fff;
+        text-transform: uppercase;
+      }
+      .sidebar-section {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .sidebar-section label {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: #888;
+        margin-bottom: 2px;
+      }
+      .tag {
+        display: inline-block;
+        background: #2a2a2a;
+        border: 1px solid #333;
+        border-radius: 4px;
+        padding: 4px 10px;
+        font-size: 12px;
+        font-family: var(--mono);
+        color: #ccc;
+      }
+      .divider {
+        border: none;
+        border-top: 1px solid #333;
+      }
+      .steps {
+        list-style: none;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .steps li {
+        font-size: 13px;
+        color: #bbb;
+        display: flex;
+        gap: 10px;
+        align-items: flex-start;
+      }
+      .steps li .num {
+        background: #333;
+        color: #fff;
+        width: 20px;
+        height: 20px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 11px;
+        font-weight: 700;
+        flex-shrink: 0;
+        margin-top: 1px;
+      }
+      .status-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #22c55e;
+        display: inline-block;
+        margin-right: 6px;
+        animation: pulse 2s infinite;
+      }
+      @keyframes pulse {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.4;
+        }
+      }
+      .sidebar-footer {
+        margin-top: auto;
+        font-size: 11px;
+        color: #555;
+      }
+
+      /* ── MAIN ── */
+      .main {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+
+      /* Header */
+      .header {
+        background: var(--card);
+        border-bottom: 1px solid var(--border);
+        padding: 16px 28px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .header-left {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+      .header-left .icon {
+        font-size: 22px;
+      }
+      .header-left h1 {
+        font-size: 18px;
+        font-weight: 700;
+      }
+      .header-left p {
+        font-size: 13px;
+        color: var(--muted);
+        margin-top: 1px;
+      }
+      .badge {
+        background: var(--accent-light);
+        color: var(--accent);
+        font-size: 11px;
+        font-weight: 600;
+        padding: 3px 10px;
+        border-radius: 100px;
+      }
+
+      /* Content area */
+      .content {
+        flex: 1;
+        overflow-y: auto;
+        padding: 24px 28px;
+        display: flex;
+        flex-direction: column;
+        gap: 20px;
+      }
+
+      /* Upload card */
+      .card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 20px;
+      }
+      .card-title {
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        margin-bottom: 14px;
+      }
+
+      /* Drop zone */
+      .dropzone {
+        border: 2px dashed var(--border);
+        border-radius: 6px;
+        padding: 32px 20px;
+        text-align: center;
+        cursor: pointer;
+        transition: all 0.2s;
+        position: relative;
+      }
+      .dropzone:hover,
+      .dropzone.drag {
+        border-color: var(--accent);
+        background: var(--accent-light);
+      }
+      .dropzone input {
+        position: absolute;
+        inset: 0;
+        opacity: 0;
+        cursor: pointer;
+        width: 100%;
+      }
+      .dropzone .dz-icon {
+        font-size: 32px;
+        margin-bottom: 8px;
+      }
+      .dropzone .dz-text {
+        font-size: 14px;
+        color: var(--text);
+        font-weight: 500;
+      }
+      .dropzone .dz-hint {
+        font-size: 12px;
+        color: var(--muted);
+        margin-top: 4px;
+      }
+
+      /* Processing bar */
+      .processing {
+        display: none;
+        margin-top: 14px;
+      }
+      .processing.show {
+        display: block;
+      }
+      .proc-step {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 0;
+        font-size: 13px;
+        color: var(--muted);
+        border-bottom: 1px solid var(--border);
+      }
+      .proc-step:last-child {
+        border-bottom: none;
+      }
+      .proc-step .spin {
+        width: 16px;
+        height: 16px;
+        border: 2px solid var(--border);
+        border-top-color: var(--accent);
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+        flex-shrink: 0;
+      }
+      .proc-step .done {
+        color: var(--success);
+        font-size: 16px;
+        flex-shrink: 0;
+      }
+      .proc-step .wait {
+        color: var(--muted);
+        font-size: 14px;
+        flex-shrink: 0;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      /* File info */
+      .file-info {
+        display: none;
+        align-items: center;
+        gap: 12px;
+        background: var(--success-light);
+        border: 1px solid #bbf7d0;
+        border-radius: 6px;
+        padding: 12px 16px;
+        margin-top: 12px;
+      }
+      .file-info.show {
+        display: flex;
+      }
+      .file-info .fi-icon {
+        font-size: 20px;
+      }
+      .file-info .fi-name {
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--success);
+      }
+      .file-info .fi-meta {
+        font-size: 12px;
+        color: #15803d;
+      }
+      .file-info .fi-remove {
+        margin-left: auto;
+        background: none;
+        border: none;
+        cursor: pointer;
+        font-size: 16px;
+        color: #15803d;
+        padding: 2px 6px;
+        border-radius: 4px;
+      }
+      .file-info .fi-remove:hover {
+        background: #bbf7d0;
+      }
+
+      /* Chat section */
+      .chat-section {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .chat-box {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        height: 280px;
+        overflow-y: auto;
+        padding: 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+      }
+      .chat-empty {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        height: 100%;
+        color: var(--muted);
+        font-size: 13px;
+        gap: 8px;
+      }
+      .chat-empty .ce-icon {
+        font-size: 28px;
+      }
+
+      .msg {
+        display: flex;
+        gap: 10px;
+        max-width: 85%;
+      }
+      .msg.user {
+        align-self: flex-end;
+        flex-direction: row-reverse;
+      }
+      .msg.bot {
+        align-self: flex-start;
+      }
+      .msg .avatar {
+        width: 28px;
+        height: 28px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 14px;
+        flex-shrink: 0;
+        margin-top: 2px;
+      }
+      .msg.user .avatar {
+        background: var(--user-bubble);
+      }
+      .msg.bot .avatar {
+        background: var(--accent-light);
+      }
+      .msg .bubble {
+        padding: 10px 14px;
+        border-radius: 12px;
+        font-size: 13.5px;
+        line-height: 1.6;
+      }
+      .msg.user .bubble {
+        background: var(--user-bubble);
+        color: #fff;
+        border-bottom-right-radius: 4px;
+      }
+      .msg.bot .bubble {
+        background: var(--card);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-bottom-left-radius: 4px;
+      }
+      .msg.bot .bubble .sources {
+        margin-top: 8px;
+        padding-top: 8px;
+        border-top: 1px solid var(--border);
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .msg.bot .bubble .src-tag {
+        display: inline-block;
+        background: #f3f4f6;
+        border: 1px solid var(--border);
+        border-radius: 3px;
+        padding: 1px 6px;
+        margin: 2px 2px 0 0;
+        font-family: var(--mono);
+        font-size: 10px;
+      }
+
+      /* Typing indicator */
+      .typing .bubble {
+        padding: 12px 16px;
+      }
+      .typing-dots {
+        display: flex;
+        gap: 4px;
+        align-items: center;
+      }
+      .typing-dots span {
+        width: 7px;
+        height: 7px;
+        background: #9ca3af;
+        border-radius: 50%;
+        animation: bounce 0.9s infinite;
+      }
+      .typing-dots span:nth-child(2) {
+        animation-delay: 0.15s;
+      }
+      .typing-dots span:nth-child(3) {
+        animation-delay: 0.3s;
+      }
+      @keyframes bounce {
+        0%,
+        80%,
+        100% {
+          transform: translateY(0);
+        }
+        40% {
+          transform: translateY(-6px);
+        }
+      }
+
+      /* Input row */
+      .input-row {
+        display: flex;
+        gap: 8px;
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 10px 14px;
+        align-items: flex-end;
+      }
+      .input-row textarea {
+        flex: 1;
+        border: none;
+        outline: none;
+        resize: none;
+        font-size: 14px;
+        font-family: inherit;
+        background: transparent;
+        color: var(--text);
+        max-height: 100px;
+        line-height: 1.5;
+      }
+      .input-row textarea::placeholder {
+        color: #9ca3af;
+      }
+      .send-btn {
+        background: var(--accent);
+        color: #fff;
+        border: none;
+        border-radius: 6px;
+        padding: 8px 16px;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: background 0.15s;
+        white-space: nowrap;
+      }
+      .send-btn:hover {
+        background: #1d4ed8;
+      }
+      .send-btn:disabled {
+        background: #9ca3af;
+        cursor: not-allowed;
+      }
+
+      .quick-q {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .qbtn {
+        font-size: 12px;
+        padding: 5px 12px;
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 100px;
+        cursor: pointer;
+        color: var(--text);
+        transition: all 0.15s;
+      }
+      .qbtn:hover {
+        border-color: var(--accent);
+        color: var(--accent);
+        background: var(--accent-light);
+      }
+
+      /* Disabled overlay */
+      .chat-section.locked .input-row,
+      .chat-section.locked .quick-q {
+        opacity: 0.45;
+        pointer-events: none;
+      }
+      .chat-section.locked .chat-empty .ce-icon {
+        opacity: 0.4;
+      }
+
+      /* Scrollbar */
+      ::-webkit-scrollbar {
+        width: 5px;
+      }
+      ::-webkit-scrollbar-track {
+        background: transparent;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #d1d5db;
+        border-radius: 10px;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- SIDEBAR -->
+    <aside class="sidebar">
+      <div>
+        <h2>📄 SmartDoc AI</h2>
+        <p style="font-size: 11px; color: #666; margin-top: 4px">
+          RAG System Demo
+        </p>
+      </div>
+
+      <hr class="divider" />
+
+      <div class="sidebar-section">
+        <label>Stack</label>
+        <span class="tag">LangChain 0.3</span>
+        <span class="tag">FAISS</span>
+        <span class="tag">MPNet 768-dim</span>
+        <span class="tag">Qwen2.5:7b</span>
+        <span class="tag">Streamlit</span>
+      </div>
+
+      <hr class="divider" />
+
+      <div class="sidebar-section">
+        <label>Hướng dẫn</label>
+        <ol class="steps">
+          <li><span class="num">1</span>Upload file PDF của bạn</li>
+          <li><span class="num">2</span>Chờ hệ thống tạo vector embeddings</li>
+          <li>
+            <span class="num">3</span>Đặt câu hỏi bằng tiếng Việt hoặc tiếng Anh
+          </li>
+        </ol>
+      </div>
+
+      <hr class="divider" />
+
+      <div class="sidebar-section">
+        <label>Trạng thái</label>
+        <div style="font-size: 13px; color: #aaa">
+          <span class="status-dot"></span>Ollama:
+          <span style="color: #22c55e">Running</span>
+        </div>
+        <div
+          id="modelStatus"
+          style="font-size: 12px; color: #666; margin-top: 4px"
+        >
+          Model: chưa tải tài liệu
+        </div>
+      </div>
+
+      <div class="sidebar-footer">Demo · OSSD Spring 2026 · SGU</div>
+    </aside>
+
+    <!-- MAIN -->
+    <div class="main">
+      <div class="header">
+        <div class="header-left">
+          <span class="icon">🤖</span>
+          <div>
+            <h1>Intelligent Document Q&A</h1>
+            <p>Hỏi đáp thông minh từ tài liệu PDF với RAG</p>
+          </div>
+        </div>
+        <span class="badge">Demo Mode</span>
+      </div>
+
+      <div class="content">
+        <!-- Upload card -->
+        <div class="card">
+          <div class="card-title">1 · Tải lên tài liệu</div>
+
+          <div class="dropzone" id="dropzone">
+            <input type="file" accept=".pdf" id="fileInput" />
+            <div class="dz-icon">📁</div>
+            <div class="dz-text">Kéo thả hoặc click để chọn PDF</div>
+            <div class="dz-hint">Chỉ hỗ trợ .pdf · Tối đa 50MB</div>
+          </div>
+
+          <div class="file-info" id="fileInfo">
+            <span class="fi-icon">📄</span>
+            <div>
+              <div class="fi-name" id="fileName">document.pdf</div>
+              <div class="fi-meta" id="fileMeta">0 trang · 0 chunks</div>
+            </div>
+            <button class="fi-remove" id="removeBtn" title="Xóa file">✕</button>
+          </div>
+
+          <div class="processing" id="processing">
+            <div class="proc-step" id="step1">
+              <span class="wait">○</span>
+              <span>PDFPlumberLoader – đọc file</span>
+            </div>
+            <div class="proc-step" id="step2">
+              <span class="wait">○</span>
+              <span
+                >RecursiveCharacterTextSplitter – chia chunks (1000 ký tự)</span
+              >
+            </div>
+            <div class="proc-step" id="step3">
+              <span class="wait">○</span>
+              <span>HuggingFaceEmbeddings – tạo vectors 768-dim</span>
+            </div>
+            <div class="proc-step" id="step4">
+              <span class="wait">○</span>
+              <span>FAISS – lưu vào vector store</span>
+            </div>
+            <div class="proc-step" id="step5">
+              <span class="wait">○</span>
+              <span>Retriever – sẵn sàng</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Chat card -->
+        <div
+          class="card"
+          style="flex: 1; display: flex; flex-direction: column; gap: 14px"
+        >
+          <div class="card-title">2 · Đặt câu hỏi</div>
+
+          <div class="chat-section locked" id="chatSection">
+            <div class="quick-q" id="quickQ">
+              <span
+                style="font-size: 12px; color: var(--muted); align-self: center"
+                >Gợi ý:</span
+              >
+              <button class="qbtn" onclick="quickAsk(this)">RAG là gì?</button>
+              <button class="qbtn" onclick="quickAsk(this)">
+                Hệ thống dùng model nào?
+              </button>
+              <button class="qbtn" onclick="quickAsk(this)">
+                Chunk size bao nhiêu?
+              </button>
+              <button class="qbtn" onclick="quickAsk(this)">
+                What is FAISS?
+              </button>
+            </div>
+
+            <div class="chat-box" id="chatBox">
+              <div class="chat-empty" id="chatEmpty">
+                <span class="ce-icon">💬</span>
+                <span>Upload tài liệu để bắt đầu hỏi đáp</span>
+              </div>
+            </div>
+
+            <div class="input-row">
+              <textarea
+                id="questionInput"
+                rows="1"
+                placeholder="Nhập câu hỏi bằng tiếng Việt hoặc tiếng Anh..."
+                onkeydown="handleKey(event)"
+                oninput="autoResize(this)"
+              ></textarea>
+              <button
+                class="send-btn"
+                id="sendBtn"
+                onclick="sendQuestion()"
+                disabled
+              >
+                Gửi ↑
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      // ── Simulated knowledge base (RAG demo answers) ─────────────────────────────
+      const KB = {
+        // Vietnamese queries
+        "rag là gì": {
+          ans: "RAG (Retrieval-Augmented Generation) là kỹ thuật kết hợp hai thành phần: Retrieval – tìm kiếm thông tin liên quan từ cơ sở dữ liệu, và Generation – dùng LLM để sinh câu trả lời dựa trên thông tin đã truy xuất. Công thức: RAG(x) = Generator(x, Retriever(x)).",
+          src: ["trang 6", "Mục 2.1"],
+        },
+        "model nào": {
+          ans: "Hệ thống sử dụng mô hình Qwen2.5:7b phát triển bởi Alibaba Cloud, chạy local qua Ollama. Đây là model transformer-based hỗ trợ context 128K tokens, tối ưu cho tiếng Việt và 50+ ngôn ngữ.",
+          src: ["trang 7", "Mục 2.3.1"],
+        },
+        "chunk size": {
+          ans: "Chunk size mặc định là 1000 ký tự, với chunk overlap là 100 ký tự. Overlap giúp đảm bảo ngữ cảnh không bị mất ở ranh giới giữa các chunks liên tiếp.",
+          src: ["trang 9", "Mục 3.3.2"],
+        },
+        embedding: {
+          ans: "Model embedding là paraphrase-multilingual-mpnet-base-v2 từ HuggingFace. Model tạo ra vector 768 chiều, hỗ trợ 50+ ngôn ngữ bao gồm tiếng Việt, sử dụng kiến trúc MPNet state-of-the-art.",
+          src: ["trang 10", "Mục 3.3.3"],
+        },
+        faiss: {
+          ans: "FAISS (Facebook AI Similarity Search) là thư viện tìm kiếm similarity cho dense vectors. Ưu điểm: tìm kiếm nhanh với hàng triệu vectors, hỗ trợ GPU acceleration, và memory-efficient indexing.",
+          src: ["trang 6", "Mục 2.2.2"],
+        },
+        langchain: {
+          ans: "LangChain là framework Python để xây dựng ứng dụng với LLMs. Gồm các thành phần: Document Loaders, Text Splitters, Embeddings, Vector Stores, Retrievers và Chains.",
+          src: ["trang 7", "Mục 2.4"],
+        },
+        streamlit: {
+          ans: "Frontend sử dụng Streamlit 1.41.1 – framework web app Python đơn giản cho phép tạo giao diện tương tác nhanh chóng. Người dùng truy cập qua http://localhost:8501.",
+          src: ["trang 12", "Mục 4.1.1"],
+        },
+        "cài đặt": {
+          ans: "Cài đặt gồm 5 bước: (1) Clone project, (2) Tạo virtual environment, (3) pip install -r requirements.txt, (4) cài Ollama và pull model qwen2.5:7b, (5) chạy streamlit run app.py.",
+          src: ["trang 13", "Mục 4.2.2"],
+        },
+        performance: {
+          ans: "Hiệu suất hệ thống: PDF Loading 2-5 giây, Embedding Generation 5-10 giây/100 chunks, Query Processing 1-3 giây, Answer Generation 3-8 giây. Độ chính xác retrieval đạt 85-90%.",
+          src: ["trang 17", "Mục 6.1.2"],
+        },
+        "hạn chế": {
+          ans: "Hạn chế của hệ thống: model 1.5B parameters có giới hạn reasoning, phụ thuộc chất lượng PDF input, cần máy tính đủ mạnh (≥8GB RAM), chủ yếu tốt cho tiếng Anh với model nhỏ.",
+          src: ["trang 18", "Mục 6.4"],
+        },
+        // English queries
+        "what is faiss": {
+          ans: "FAISS (Facebook AI Similarity Search) is a library for efficient similarity search and clustering of dense vectors. It supports fast search with millions of vectors, GPU acceleration, and memory-efficient indexing.",
+          src: ["page 6", "Section 2.2.2"],
+        },
+        "what is rag": {
+          ans: "RAG (Retrieval-Augmented Generation) combines Information Retrieval and Natural Language Generation. It first retrieves relevant documents from a vector database, then passes them as context to an LLM to generate accurate answers.",
+          src: ["page 6", "Section 2.1"],
+        },
+        qwen: {
+          ans: "Qwen2.5 is a large language model by Alibaba Cloud. It features transformer-based architecture, supports up to 128K token context, and excels at Vietnamese and multilingual tasks. The 7B parameter version balances performance and quality.",
+          src: ["page 7", "Section 2.3.1"],
+        },
+        default: {
+          ans: "Tôi tìm thấy một số thông tin liên quan trong tài liệu nhưng không có câu trả lời cụ thể cho câu hỏi này. Hãy thử đặt câu hỏi rõ ràng hơn hoặc dùng từ khóa từ tài liệu.",
+          src: ["—"],
+        },
+      };
+
+      function findAnswer(q) {
+        const lq = q.toLowerCase();
+        for (const [key, val] of Object.entries(KB)) {
+          if (key === "default") continue;
+          if (lq.includes(key)) return val;
+        }
+        return KB["default"];
+      }
+
+      // ── File upload handling ─────────────────────────────────────────────────────
+      let docLoaded = false;
+
+      document
+        .getElementById("fileInput")
+        .addEventListener("change", function (e) {
+          if (e.target.files[0]) handleFile(e.target.files[0]);
+        });
+
+      const dz = document.getElementById("dropzone");
+      dz.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        dz.classList.add("drag");
+      });
+      dz.addEventListener("dragleave", () => dz.classList.remove("drag"));
+      dz.addEventListener("drop", (e) => {
+        e.preventDefault();
+        dz.classList.remove("drag");
+        if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+      });
+
+      document.getElementById("removeBtn").addEventListener("click", () => {
+        resetDoc();
+      });
+
+      function handleFile(file) {
+        if (!file.name.endsWith(".pdf")) {
+          alert("❌ Chỉ hỗ trợ file PDF!");
+          return;
+        }
+
+        document.getElementById("dropzone").style.display = "none";
+        document.getElementById("processing").classList.add("show");
+        document.getElementById("modelStatus").textContent =
+          "Model: đang xử lý...";
+
+        // Simulate processing steps
+        const steps = ["step1", "step2", "step3", "step4", "step5"];
+        const delays = [600, 1200, 2200, 3000, 3600];
+        const chunkCount = Math.floor(Math.random() * 40) + 20;
+
+        steps.forEach((id, i) => {
+          setTimeout(() => {
+            const el = document.getElementById(id);
+            el.querySelector(".wait, .spin")?.classList.remove("wait");
+            if (i > 0) {
+              const prev = document.getElementById(steps[i - 1]);
+              const prevSpan = prev.querySelector(".spin");
+              if (prevSpan) {
+                prevSpan.outerHTML = '<span class="done">✓</span>';
+              }
+            }
+            el.querySelector(".wait") &&
+              (el.querySelector(".wait").className = "spin");
+            if (i === steps.length - 1) {
+              setTimeout(() => {
+                el.querySelector(".spin").outerHTML =
+                  '<span class="done">✓</span>';
+                finishLoading(file.name, chunkCount);
+              }, 500);
+            }
+          }, delays[i]);
+        });
+      }
+
+      function finishLoading(name, chunks) {
+        document.getElementById("processing").classList.remove("show");
+        const fi = document.getElementById("fileInfo");
+        fi.classList.add("show");
+        document.getElementById("fileName").textContent = name;
+        document.getElementById("fileMeta").textContent =
+          `${chunks} chunks · Vector store sẵn sàng`;
+        document.getElementById("modelStatus").textContent = `Đã tải: ${name}`;
+        document.getElementById("chatSection").classList.remove("locked");
+        document.getElementById("sendBtn").disabled = false;
+        document.getElementById("chatEmpty").innerHTML = `
+    <span class="ce-icon">✅</span>
+    <span>Tài liệu đã sẵn sàng – hãy đặt câu hỏi!</span>`;
+        docLoaded = true;
+      }
+
+      function resetDoc() {
+        docLoaded = false;
+        document.getElementById("dropzone").style.display = "";
+        document.getElementById("fileInfo").classList.remove("show");
+        document.getElementById("processing").classList.remove("show");
+        document.getElementById("fileInput").value = "";
+        document.getElementById("modelStatus").textContent =
+          "Model: chưa tải tài liệu";
+        document.getElementById("chatSection").classList.add("locked");
+        document.getElementById("sendBtn").disabled = true;
+        document.getElementById("chatBox").innerHTML = `
+    <div class="chat-empty" id="chatEmpty">
+      <span class="ce-icon">💬</span>
+      <span>Upload tài liệu để bắt đầu hỏi đáp</span>
+    </div>`;
+        // Reset steps
+        ["step1", "step2", "step3", "step4", "step5"].forEach((id) => {
+          const el = document.getElementById(id);
+          const icon = el.querySelector(".done,.spin");
+          if (icon) icon.outerHTML = '<span class="wait">○</span>';
+        });
+      }
+
+      // ── Chat ─────────────────────────────────────────────────────────────────────
+      function quickAsk(btn) {
+        if (!docLoaded) return;
+        document.getElementById("questionInput").value = btn.textContent;
+        sendQuestion();
+      }
+
+      function autoResize(el) {
+        el.style.height = "auto";
+        el.style.height = el.scrollHeight + "px";
+      }
+
+      function handleKey(e) {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          sendQuestion();
+        }
+      }
+
+      function sendQuestion() {
+        const input = document.getElementById("questionInput");
+        const q = input.value.trim();
+        if (!q || !docLoaded) return;
+
+        // Remove empty state
+        const empty = document.getElementById("chatEmpty");
+        if (empty) empty.remove();
+
+        // Add user message
+        addMsg("user", q);
+        input.value = "";
+        input.style.height = "auto";
+        document.getElementById("sendBtn").disabled = true;
+
+        // Add typing indicator
+        const typingId = "typing_" + Date.now();
+        addTyping(typingId);
+
+        const delay = 800 + Math.random() * 1200;
+        setTimeout(() => {
+          document.getElementById(typingId)?.remove();
+          const result = findAnswer(q);
+          addMsg("bot", result.ans, result.src);
+          document.getElementById("sendBtn").disabled = false;
+        }, delay);
+      }
+
+      function addMsg(role, text, sources) {
+        const box = document.getElementById("chatBox");
+        const div = document.createElement("div");
+        div.className = `msg ${role}`;
+
+        const avatar = document.createElement("div");
+        avatar.className = "avatar";
+        avatar.textContent = role === "user" ? "👤" : "🤖";
+
+        const bubble = document.createElement("div");
+        bubble.className = "bubble";
+        bubble.textContent = text;
+
+        if (sources && role === "bot") {
+          const srcDiv = document.createElement("div");
+          srcDiv.className = "sources";
+          srcDiv.innerHTML =
+            "📎 Nguồn: " +
+            sources.map((s) => `<span class="src-tag">${s}</span>`).join(" ");
+          bubble.appendChild(srcDiv);
+        }
+
+        div.appendChild(avatar);
+        div.appendChild(bubble);
+        box.appendChild(div);
+        box.scrollTop = box.scrollHeight;
+      }
+
+      function addTyping(id) {
+        const box = document.getElementById("chatBox");
+        const div = document.createElement("div");
+        div.className = "msg bot typing";
+        div.id = id;
+        div.innerHTML = `
+    <div class="avatar">🤖</div>
+    <div class="bubble">
+      <div class="typing-dots">
+        <span></span><span></span><span></span>
+      </div>
+    </div>`;
+        box.appendChild(div);
+        box.scrollTop = box.scrollHeight;
+      }
+    </script>
+  </body>
+</html>
