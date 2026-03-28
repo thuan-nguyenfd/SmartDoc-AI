@@ -52,7 +52,7 @@ SmartDoc AI cho phép người dùng **tải lên tài liệu PDF** và **đặt
 
 ## 1. Cài đặt Ollama (Windows)
 
-Ollama là runtime để chạy LLM local. Cần cài trên **Windows** (không phải trong WSL).
+Ollama là runtime để chạy LLM local. Cần cài trên **Windows**.
 
 **Bước 1:** Tải Ollama tại https://ollama.ai → chọn **Download for Windows**
 
@@ -68,27 +68,9 @@ ollama --version
 ollama serve
 ```
 
-**Bước 4:** Tải model Qwen2.5 (chọn 1 trong 2 tùy RAM/VRAM):
-
-```powershell
-# Model đầy đủ — cần 6GB VRAM hoặc 8GB RAM (chất lượng tốt hơn)
-ollama pull qwen2.5:7b
-
-# Model nhỏ — cần 2GB RAM (nhẹ hơn, phù hợp máy yếu)
-ollama pull qwen2.5:1.5b
-```
-
-**Bước 5:** Kiểm tra model đã tải:
-
-```powershell
-ollama list
-```
-
----
-
 ## 2. Pull project từ Git
 
-Mở terminal (hoặc WSL), chạy:
+Mở terminal, chạy:
 
 ```bash
 git https://github.com/thuan-nguyenfd/SmartDoc-AI.git
@@ -101,20 +83,15 @@ Tạo và kích hoạt virtual environment để tránh xung đột thư viện:
 
 ```bash
 # Tạo môi trường ảo
-python3 -m venv venv
+python -m venv venv
 ```
 
 ```bash
-# Kích hoạt — Linux / WSL / macOS
-source venv/bin/activate
-
 # Kích hoạt — Windows PowerShell
 venv\Scripts\activate
 ```
 
 Sau khi kích hoạt, terminal sẽ hiển thị `(venv)` ở đầu dòng.
-
-> **VS Code:** Nhấn `Ctrl+Shift+P` → gõ `Python: Select Interpreter` → chọn `./venv/bin/python`
 
 ---
 
@@ -123,18 +100,6 @@ Sau khi kích hoạt, terminal sẽ hiển thị `(venv)` ở đầu dòng.
 ```bash
 pip install -r requirements.txt
 ```
-
-Nếu gặp cảnh báo về phiên bản cũ, cài thêm package mới hơn:
-
-```bash
-# Cập nhật HuggingFace Embeddings (tránh deprecation warning)
-pip install -U langchain-huggingface
-
-# Cập nhật Ollama client (tránh deprecation warning)
-pip install -U langchain-ollama
-```
-
----
 
 ## 5. Cấu hình
 
@@ -149,34 +114,8 @@ App chạy trong WSL không thể dùng `localhost` để kết nối Windows. C
 **Cách 1 — Dùng biến môi trường (khuyên dùng):**
 
 ```bash
-export OLLAMA_HOST=http://192.168.1.40:11434
 streamlit run app.py
 ```
-
-**Cách 2 — Tìm IP Windows từ WSL:**
-
-```bash
-cat /etc/resolv.conf | grep nameserver
-# hoặc
-ip route | grep default | awk '{print $3}'
-```
-
-**Cách 3 — Đổi cứng trong `app.py`:**
-
-```python
-# Dòng 15 trong app.py
-OLLAMA_HOST = "http://192.168.1.40:11434"  # thay bằng IP thực của bạn
-```
-
-### Chọn model (nếu cần đổi)
-
-Mở `app.py`, tìm và sửa dòng:
-
-```python
-llm = Ollama(model="qwen2.5:7b", ...)   # đổi thành "qwen2.5:1.5b" nếu máy yếu
-```
-
----
 
 ## 6. Chạy dự án
 
@@ -229,55 +168,6 @@ http://localhost:8501
 
 - **Xóa lịch sử chat:** Nhấn nút 🗑️ trong sidebar
 - **Đổi tài liệu mới:** Nhấn nút 🔄 trong sidebar rồi upload lại
-
----
-
-## Xử lý lỗi thường gặp
-
-### ❌ `Connection refused` khi kết nối Ollama
-
-```
-Nguyên nhân: Ollama chưa chạy hoặc sai địa chỉ IP
-Cách fix:
-  1. Kiểm tra Ollama đang chạy: mở PowerShell → ollama serve
-  2. Kiểm tra IP: xem lại biến OLLAMA_HOST trong app.py
-  3. Thử curl http://192.168.1.40:11434 từ WSL
-```
-
-### ❌ `CUDA error: out of memory`
-
-```
-Nguyên nhân: VRAM không đủ cho model 7B
-Cách fix:
-  1. Tắt Ollama hoàn toàn: taskkill /F /IM ollama.exe (Windows)
-  2. Bật lại: $env:OLLAMA_MAX_LOADED_MODELS=1; ollama serve
-  3. Hoặc dùng model nhỏ hơn: ollama pull qwen2.5:1.5b
-     rồi đổi trong app.py: model="qwen2.5:1.5b"
-```
-
-### ❌ `LangChainDeprecationWarning`
-
-```
-Nguyên nhân: dùng class cũ của LangChain
-Cách fix: pip install -U langchain-huggingface langchain-ollama
-  Không ảnh hưởng chức năng, chỉ là cảnh báo.
-```
-
-### ❌ PDF không trích xuất được text
-
-```
-Nguyên nhân: PDF dạng scan (ảnh chụp), không có text thật
-Cách fix: dùng công cụ OCR như Adobe Acrobat hoặc tesseract
-  để convert sang PDF có text trước khi upload.
-```
-
-### ❌ Embedding model tải chậm lần đầu
-
-```
-Nguyên nhân: tải model MPNet ~440MB từ HuggingFace
-Giải thích: chỉ tải 1 lần duy nhất, lần sau dùng cache local.
-  Không cần làm gì, chờ download xong.
-```
 
 ---
 

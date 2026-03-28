@@ -99,24 +99,7 @@ def clear_all_history():
 # Khởi tạo DB ngay khi app chạy
 init_db()
 
-# ── Tự động lấy IP Windows host (WSL2) ───────────────────────
-def get_windows_host_ip():
-    try:
-        result = subprocess.check_output(["ip", "route", "show", "default"]).decode().strip()
-        gateway = result.split()[2]
-        return f"http://{gateway}:11434"
-    except Exception:
-        try:
-            with open("/etc/resolv.conf") as f:
-                for line in f:
-                    if line.startswith("nameserver"):
-                        ip = line.split()[1]
-                        return f"http://{ip}:11434"
-        except Exception:
-            pass
-        return os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-
-OLLAMA_HOST = get_windows_host_ip()
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
 # ══════════════════════════════════════════════════════════════
 # PAGE CONFIG + CSS
