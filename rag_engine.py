@@ -121,23 +121,44 @@ def _detect_language(text: str) -> str:
 
 
 def _build_prompt(language: str) -> PromptTemplate:
-    """Tạo PromptTemplate theo ngôn ngữ."""
     if language == "vi":
-        template = (
-            "Sử dụng ngữ cảnh sau để trả lời câu hỏi.\n"
-            "Nếu không biết, hãy nói không biết. Trả lời ngắn gọn bằng tiếng Việt.\n\n"
-            "Ngữ cảnh: {context}\n\n"
-            "Câu hỏi: {question}\n\n"
-            "Trả lời:"
-        )
+        template = """Bạn là trợ lý chuyên phân tích tài liệu. Nhiệm vụ của bạn là trả lời câu hỏi \
+DỰA HOÀN TOÀN vào ngữ cảnh được cung cấp bên dưới.
+
+QUY TẮC:
+- Chỉ sử dụng thông tin có trong [NGỮ CẢNH]. Không thêm kiến thức bên ngoài.
+- Nếu ngữ cảnh có đủ thông tin: trả lời đầy đủ, có cấu trúc rõ ràng.
+- Nếu ngữ cảnh chỉ có một phần: trả lời phần biết, nói rõ phần nào không có trong tài liệu.
+- Nếu ngữ cảnh không có thông tin liên quan: trả lời "Tài liệu không đề cập đến vấn đề này."
+- Trích dẫn ý chính từ ngữ cảnh khi cần thiết để tăng độ tin cậy.
+
+[NGỮ CẢNH]
+{context}
+
+[CÂU HỎI]
+{question}
+
+[TRẢ LỜI]"""
+
     else:
-        template = (
-            "Use the context below to answer the question.\n"
-            "If you don't know, say so. Keep the answer concise.\n\n"
-            "Context: {context}\n\n"
-            "Question: {question}\n\n"
-            "Answer:"
-        )
+        template = """You are a document analysis assistant. Your task is to answer questions \
+based EXCLUSIVELY on the context provided below.
+
+RULES:
+- Only use information present in [CONTEXT]. Do not add outside knowledge.
+- If context has enough info: answer fully with clear structure.
+- If context has partial info: answer what you can, clearly state what's missing.
+- If context has no relevant info: respond "The document does not mention this topic."
+- Quote key phrases from the context when it strengthens your answer.
+
+[CONTEXT]
+{context}
+
+[QUESTION]
+{question}
+
+[ANSWER]"""
+
     return PromptTemplate(template=template, input_variables=["context", "question"])
 
 
