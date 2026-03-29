@@ -1,1 +1,0 @@
-# Self-RAG, query rewriting, confidence scoring

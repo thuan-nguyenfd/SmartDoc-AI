@@ -1,1 +1,0 @@
-# Helper functions (get_windows_host_ip, language detect...)
