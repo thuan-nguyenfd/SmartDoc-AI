@@ -93,23 +93,60 @@ def process_pdf(file_path: str, embedder) -> tuple:
     return retriever, len(docs), len(chunks)
 
 
-# Câu 1 — bỏ comment để bật hỗ trợ DOCX:
-# def process_docx(file_path: str, embedder) -> tuple:
-#     from langchain_community.document_loaders import Docx2txtLoader
-#     loader   = Docx2txtLoader(file_path)
-#     docs     = loader.load()
-#     splitter = RecursiveCharacterTextSplitter(
-#         chunk_size=CONFIG["chunk_size"],
-#         chunk_overlap=CONFIG["chunk_overlap"],
-#     )
-#     chunks       = splitter.split_documents(docs)
-#     vector_store = FAISS.from_documents(chunks, embedder)
-#     retriever    = vector_store.as_retriever(
-#         search_type="similarity",
-#         search_kwargs={"k": CONFIG["retriever_k"]},
-#     )
-#     return retriever, len(docs), len(chunks)
+# Câu 1 — hỗ trợ DOCX:
+def process_docx(file_path: str, embedder) -> tuple:
+    """
+    Đọc file DOCX → chunk → FAISS.
+    
+    Ước lượng số trang dựa trên tổng ký tự nội dung:
+    - Trung bình 1 trang A4 ≈ 1800–2200 ký tự (font 12, giãn dòng 1.5)
+    - Dùng 2000 ký tự/trang làm baseline, có thể chỉnh qua CHARS_PER_PAGE
+    """
+    from langchain_community.document_loaders import Docx2txtLoader
+    import docx
 
+    CHARS_PER_PAGE = 2000  # ← Chỉnh hằng số này nếu muốn calibrate
+
+    loader = Docx2txtLoader(file_path)
+    docs   = loader.load()
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CONFIG["chunk_size"],
+        chunk_overlap=CONFIG["chunk_overlap"],
+    )
+    chunks = splitter.split_documents(docs)
+
+    vector_store = FAISS.from_documents(chunks, embedder)
+    retriever = vector_store.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": CONFIG["retriever_k"]},
+    )
+
+    # ── Ước lượng số trang ────────────────────────────────────
+    try:
+        doc = docx.Document(file_path)
+
+        # Đếm ký tự thực từ tất cả paragraph (bỏ khoảng trắng thừa)
+        total_chars = sum(
+            len(para.text.strip())
+            for para in doc.paragraphs
+            if para.text.strip()
+        )
+
+        # Cộng thêm ký tự trong bảng (table cells)
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    total_chars += len(cell.text.strip())
+
+        num_pages = max(1, round(total_chars / CHARS_PER_PAGE))
+
+    except Exception:
+        # Fallback: ước lượng từ tổng nội dung đã load
+        total_chars = sum(len(d.page_content) for d in docs)
+        num_pages = max(1, round(total_chars / CHARS_PER_PAGE))
+
+    return retriever, num_pages, len(chunks)
 
 # ══════════════════════════════════════════════════════════════
 # 3. HELPERS NỘI BỘ

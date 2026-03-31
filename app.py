@@ -17,7 +17,7 @@ import tempfile
 import urllib.request
 import uuid
 import datetime
-
+import math
 import streamlit as st
 
 from database import (
@@ -28,7 +28,7 @@ from database import (
     delete_session,
     clear_all_history,
 )
-from rag_engine import get_embedder, process_pdf, ask_question_stream
+from rag_engine import get_embedder, process_pdf, process_docx, ask_question_stream
 from styles import APP_CSS
 
 # ══════════════════════════════════════════════════════════════
@@ -225,40 +225,56 @@ st.markdown("""
 # ── Upload PDF ────────────────────────────────────────────────
 
 uploaded_file = st.file_uploader(
-    "📁 Kéo thả hoặc click để tải lên file PDF (tối đa 20MB)",
-    type=["pdf"],
-    help="Chỉ hỗ trợ file PDF",
+    "📁 Kéo thả hoặc click để tải lên file (PDF hoặc DOCX - tối đa 20MB)",
+    type=["pdf", "docx"], #them xu ly file doc o day
+    help="Chỉ hỗ trợ file PDF và .docx",
 )
 
 if uploaded_file is not None and uploaded_file.size > 20 * 1024 * 1024:
     st.error("❌ File quá lớn! Vui lòng chọn file dưới 20MB.")
     uploaded_file = None
 
+
+#xu ly file khi ng dung upload va chua co retriever
 if uploaded_file is not None and st.session_state.retriever is None:
-    with st.spinner("⏳ Đang xử lý tài liệu... vui lòng chờ"):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+    file_extension = uploaded_file.name.lower().split('.')[-1] # lấy đuôi file
+    with st.spinner(f"⏳ Đang xử lý tài liệu { file_extension.upper() }... vui lòng chờ"):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_extension}") as tmp:
             tmp.write(uploaded_file.read())
             tmp_path = tmp.name
         try:
             embedder  = _cached_embedder()
-            retriever, num_pages, num_chunks = process_pdf(tmp_path, embedder)
-            st.session_state.retriever = retriever
-            st.session_state.pdf_info  = {
-                "name":   uploaded_file.name,
-                "pages":  num_pages,
-                "chunks": num_chunks,
-            }
-            _mark_sessions_dirty()
+            if file_extension == "pdf":
+                retriever, num_pages, num_chunks = process_pdf(tmp_path, embedder)
+                file_type= "PDF"
+            elif file_extension == "docx":
+                retriever, num_pages, num_chunks = process_docx(tmp_path, embedder)
+                file_type= "DOCX"
+            else:
+                st.error(f"Hệ thống hiện chưa hỗ trợ định dạng file {file_extension.upper()}")
+                retriever=None
+
+            if retriever:       
+                st.session_state.retriever = retriever
+                st.session_state.pdf_info  = {
+                    "name":   uploaded_file.name,
+                    "type": file_type,
+                    "pages":  num_pages,
+                    "chunks": num_chunks,
+                }
+                _mark_sessions_dirty()
         except Exception as e:
-            st.error(f"❌ Lỗi xử lý PDF: {e}")
+            st.error(f"❌ Lỗi xử lý file {file_extension.upper()}: {e}")
         finally:
-            os.unlink(tmp_path)
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
 if st.session_state.pdf_info:
     info = st.session_state.pdf_info
+    file_icon = "📄" if info.get("type") == "PDF" else "📝"
     st.markdown(f"""
     <div class="status-row">
-        <span class="status-chip">📄 {info['name']}</span>
+        <span class="status-chip">{file_icon} {info['name']}</span>
         <span class="status-chip">📑 {info['pages']} trang</span>
         <span class="status-chip">🧩 {info['chunks']} chunks</span>
         <span class="status-chip ready">✅ FAISS Ready</span>
@@ -286,7 +302,7 @@ if st.session_state.view_session and st.session_state.view_session != st.session
         st.session_state.view_session = None
 
 elif st.session_state.retriever is None:
-    st.info("💡 Vui lòng upload file PDF để bắt đầu hỏi đáp.")
+    st.info("💡 Vui lòng upload file PDF hoặc DOCX để bắt đầu hỏi đáp.")
 
 else:
     for item in st.session_state.chat_history:
