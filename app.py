@@ -157,16 +157,24 @@ with st.sidebar:
 
             with col1:
                 if st.button("✅ Đồng ý", type="primary", use_container_width=True):
+                    delete_session(st.session_state.session_id)
+                    st.session_state.chat_history = []
+                    _mark_sessions_dirty()
                     st.success("Đã xóa thành công!")
+                    
                     st.rerun()
 
             with col2:
                 if st.button("❌ Hủy", type="secondary", use_container_width=True):
+            
                     st.rerun()
+
 
         # Nút "Xóa thử" ở Sidebar - SỬA KEY
     if st.button("Xóa thử", key="btn_delete_test_sidebar", use_container_width=True):
             delete_confirm_dialog()   
+
+
 
     st.markdown("### Model")
     st.markdown(f"""
@@ -193,16 +201,20 @@ with st.sidebar:
     col1, col2 = st.columns(2)
     with col1:
         if st.button("🗑 Xóa chat", use_container_width=True):
-            delete_session(st.session_state.session_id)
-            st.session_state.chat_history = []
-            _mark_sessions_dirty()
-            st.rerun()
+            delete_confirm_dialog()
+            
+            # delete_session(st.session_state.session_id)
+            # st.session_state.chat_history = []
+            # mark_sessions_dirty()
+            # st.rerun()
+            
     with col2:
         if st.button("📄 Xóa PDF", use_container_width=True):
-            st.session_state.retriever    = None
-            st.session_state.chat_history = []
-            st.session_state.pdf_info     = None
-            st.rerun()
+            delete_confirm_dialog_xoa_upload()
+            # st.session_state.retriever    = None
+            # st.session_state.chat_history = []
+            # st.session_state.pdf_info     = None
+            # st.rerun()
     st.divider()
 
     # FIX LAG #2 — dùng cached sessions
