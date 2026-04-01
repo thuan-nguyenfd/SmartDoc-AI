@@ -105,7 +105,7 @@ def process_docx(file_path: str, embedder) -> tuple:
     from langchain_community.document_loaders import Docx2txtLoader
     import docx
 
-    CHARS_PER_PAGE = 2000  # ← Chỉnh hằng số này nếu muốn calibrate
+    CHARS_PER_PAGE = 1000  # ← Chỉnh hằng số này nếu muốn calibrate
 
     loader = Docx2txtLoader(file_path)
     docs   = loader.load()

@@ -147,6 +147,27 @@ with st.sidebar:
     """, unsafe_allow_html=True)
     st.divider()
 
+    # ====================== DIALOG XÁC NHẬN XÓA ======================
+
+    @st.dialog("⚠️ Xác nhận xóa")
+    def delete_confirm_dialog():
+            st.caption("Hành động này không thể hoàn tác.")
+
+            col1, col2 = st.columns(2, gap="small")
+
+            with col1:
+                if st.button("✅ Đồng ý", type="primary", use_container_width=True):
+                    st.success("Đã xóa thành công!")
+                    st.rerun()
+
+            with col2:
+                if st.button("❌ Hủy", type="secondary", use_container_width=True):
+                    st.rerun()
+
+        # Nút "Xóa thử" ở Sidebar - SỬA KEY
+    if st.button("Xóa thử", key="btn_delete_test_sidebar", use_container_width=True):
+            delete_confirm_dialog()   
+
     st.markdown("### Model")
     st.markdown(f"""
 <div class="setting-item"><span>LLM</span><code>{RAG_CONFIG['llm_model']}</code></div>
@@ -154,6 +175,7 @@ with st.sidebar:
 <div class="setting-item"><span>Vector DB</span><code>FAISS</code></div>
 <div class="setting-item"><span>Framework</span><code>LangChain</code></div>
     """, unsafe_allow_html=True)
+
     st.divider()
 
     # FIX LAG #1 — dùng cached status, không gọi network mỗi rerun
@@ -221,6 +243,11 @@ st.markdown("""
     Tải lên tài liệu PDF và trò chuyện với AI để nhận thông tin chính xác, nhanh chóng
 </div>
 """, unsafe_allow_html=True)
+
+
+ 
+
+
 
 # ── Upload PDF ────────────────────────────────────────────────
 
