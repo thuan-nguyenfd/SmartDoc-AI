@@ -84,13 +84,17 @@ def load_all_sessions() -> list[tuple]:
     Tải danh sách tất cả session (dùng để hiển thị sidebar).
 
     Trả về:
-        list of (session_id, pdf_name, count, started)
+        list of (session_id, first_question, count, started)
+        - first_question: câu hỏi đầu tiên của session (thay vì tên file)
     """
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
-        SELECT session, pdf_name, COUNT(*) as cnt,
-               MIN(timestamp) as started
+        SELECT
+            session,
+            MIN(question) AS first_question,
+            COUNT(*)      AS cnt,
+            MIN(timestamp) AS started
         FROM conversations
         GROUP BY session
         ORDER BY started DESC

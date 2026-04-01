@@ -62,6 +62,7 @@ _defaults = {
     "ollama_ok":        None,   # None = chưa check, True/False = kết quả
     "sessions_cache":   None,   # cache load_all_sessions()
     "sessions_dirty":   True,   # True = cần reload từ DB
+    "uploader_key":       0,
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -119,69 +120,97 @@ def _mark_sessions_dirty():
 
 
 # ══════════════════════════════════════════════════════════════
+# CONFIRM DIALOGS
+# ══════════════════════════════════════════════════════════════
+
+@st.dialog("✨ Bắt đầu đoạn chat mới?")
+def _dialog_new_chat():
+    st.caption("Chat hiện tại và tài liệu đang tải sẽ bị xóa. Lịch sử hội thoại vẫn được lưu lại.")
+    col1, col2 = st.columns(2, gap="small")
+    with col1:
+        if st.button("Đồng ý", type="primary", use_container_width=True):
+            # Tạo session_id mới → đoạn chat hoàn toàn mới
+            st.session_state.session_id   = str(uuid.uuid4())[:8]
+            st.session_state.chat_history = []
+            st.session_state.retriever    = None
+            st.session_state.pdf_info     = None
+            st.session_state.view_session = None
+            st.session_state.uploader_key += 1
+            _mark_sessions_dirty()
+            st.rerun()
+    with col2:
+        if st.button("Hủy", type="secondary", use_container_width=True):
+            st.rerun()
+    
+
+@st.dialog("🗑 Xóa tất cả lịch sử?")
+def _dialog_clear_all_history():
+    st.warning("**Toàn bộ** lịch sử của mọi phiên sẽ bị xóa vĩnh viễn. Không thể hoàn tác.")
+    col1, col2 = st.columns(2, gap="small")
+    with col1:
+        if st.button("Xác nhận", type="primary", use_container_width=True):
+            clear_all_history()
+            st.session_state.chat_history = []
+            st.session_state.view_session = None
+            _mark_sessions_dirty()
+            st.rerun()
+    with col2:
+        if st.button("Hủy", use_container_width=True):
+            st.rerun()
+
+@st.dialog("🗑 Xóa tài liệu đang tải?")
+def _dialog_delete_pdf():
+    info = st.session_state.pdf_info
+    name = info["name"] if info else "tài liệu hiện tại"
+    st.warning(f"Tài liệu **{name}** sẽ bị gỡ khỏi hệ thống. Lịch sử chat vẫn được giữ lại.")
+    col1, col2 = st.columns(2, gap="small")
+    with col1:
+        if st.button("Xác nhận", type="primary", use_container_width=True):
+            st.session_state.uploader_key += 1
+            st.session_state.retriever    = None
+            st.session_state.pdf_info     = None
+            st.rerun()
+    with col2:
+        if st.button("Hủy", use_container_width=True):
+            st.rerun()
+
+
+
+# ══════════════════════════════════════════════════════════════
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════
 
 with st.sidebar:
-    st.markdown("## 📄 SmartDoc AI")
+    st.markdown("## SMARTDOC AI")
     st.caption("RAG · Qwen2.5 · FAISS")
     st.divider()
 
     st.markdown("### Hướng dẫn")
     st.markdown("""
-1. Upload file PDF  
-2. Chờ hệ thống xử lý  
-3. Nhập câu hỏi  
-4. Nhận câu trả lời  
-    """)
+        1. Upload file PDF  
+        2. Chờ hệ thống xử lý  
+        3. Nhập câu hỏi  
+        4. Nhận câu trả lời  
+            """)
     st.divider()
 
     from rag_engine import CONFIG as RAG_CONFIG
     st.markdown("### Cài đặt")
     st.markdown(f"""
-<div class="setting-item"><span>Chunk Size</span><code>{RAG_CONFIG['chunk_size']}</code></div>
-<div class="setting-item"><span>Chunk Overlap</span><code>{RAG_CONFIG['chunk_overlap']}</code></div>
-<div class="setting-item"><span>Top K</span><code>{RAG_CONFIG['retriever_k']}</code></div>
-<div class="setting-item"><span>Temperature</span><code>{RAG_CONFIG['llm_temperature']}</code></div>
-<div class="setting-item"><span>Device</span><code>{RAG_CONFIG['embedding_device'].upper()}</code></div>
+        <div class="setting-item"><span>Chunk Size</span><code>{RAG_CONFIG['chunk_size']}</code></div>
+        <div class="setting-item"><span>Chunk Overlap</span><code>{RAG_CONFIG['chunk_overlap']}</code></div>
+        <div class="setting-item"><span>Top K</span><code>{RAG_CONFIG['retriever_k']}</code></div>
+        <div class="setting-item"><span>Temperature</span><code>{RAG_CONFIG['llm_temperature']}</code></div>
+        <div class="setting-item"><span>Device</span><code>{RAG_CONFIG['embedding_device'].upper()}</code></div>
     """, unsafe_allow_html=True)
     st.divider()
 
-    # ====================== DIALOG XÁC NHẬN XÓA ======================
-
-    @st.dialog("⚠️ Xác nhận xóa")
-    def delete_confirm_dialog():
-            st.caption("Hành động này không thể hoàn tác.")
-
-            col1, col2 = st.columns(2, gap="small")
-
-            with col1:
-                if st.button("✅ Đồng ý", type="primary", use_container_width=True):
-                    delete_session(st.session_state.session_id)
-                    st.session_state.chat_history = []
-                    _mark_sessions_dirty()
-                    st.success("Đã xóa thành công!")
-                    
-                    st.rerun()
-
-            with col2:
-                if st.button("❌ Hủy", type="secondary", use_container_width=True):
-            
-                    st.rerun()
-
-
-        # Nút "Xóa thử" ở Sidebar - SỬA KEY
-    if st.button("Xóa thử", key="btn_delete_test_sidebar", use_container_width=True):
-            delete_confirm_dialog()   
-
-
-
     st.markdown("### Model")
     st.markdown(f"""
-<div class="setting-item"><span>LLM</span><code>{RAG_CONFIG['llm_model']}</code></div>
-<div class="setting-item"><span>Embedding</span><code>mpnet-base-v2</code></div>
-<div class="setting-item"><span>Vector DB</span><code>FAISS</code></div>
-<div class="setting-item"><span>Framework</span><code>LangChain</code></div>
+        <div class="setting-item"><span>LLM</span><code>{RAG_CONFIG['llm_model']}</code></div>
+        <div class="setting-item"><span>Embedding</span><code>mpnet-base-v2</code></div>
+        <div class="setting-item"><span>Vector DB</span><code>FAISS</code></div>
+        <div class="setting-item"><span>Framework</span><code>LangChain</code></div>
     """, unsafe_allow_html=True)
 
     st.divider()
@@ -197,44 +226,39 @@ with st.sidebar:
             st.rerun()
     st.divider()
 
-    # Nút xóa
+    # Nút chat mới và xóa file
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("🗑 Xóa chat", use_container_width=True):
-            delete_confirm_dialog()
-            
-            # delete_session(st.session_state.session_id)
-            # st.session_state.chat_history = []
-            # mark_sessions_dirty()
-            # st.rerun()
-            
+        if st.button("New chat", use_container_width=True):
+            # Tạo session_id mới → đoạn chat hoàn toàn mới
+            st.session_state.session_id   = str(uuid.uuid4())[:8]
+            st.session_state.chat_history = []
+            st.session_state.retriever    = None
+            st.session_state.pdf_info     = None
+            st.session_state.view_session = None
+            st.session_state.uploader_key += 1
+            _mark_sessions_dirty()
+            st.rerun()
     with col2:
-        if st.button("📄 Xóa PDF", use_container_width=True):
-            delete_confirm_dialog_xoa_upload()
-            # st.session_state.retriever    = None
-            # st.session_state.chat_history = []
-            # st.session_state.pdf_info     = None
-            # st.rerun()
+        pdf_btn_disabled = st.session_state.pdf_info is None
+        if st.button("🗑 Xóa tài liệu", use_container_width=True, disabled=pdf_btn_disabled):
+            _dialog_delete_pdf()
     st.divider()
 
-    # FIX LAG #2 — dùng cached sessions
+    #lich su hoi thoai
     st.markdown("### Lịch sử hội thoại")
     all_sessions = _get_sessions()
 
     if not all_sessions:
         st.caption("Chưa có lịch sử nào.")
     else:
-        if st.button("🗑 Xóa tất cả lịch sử", use_container_width=True):
-            clear_all_history()
-            st.session_state.chat_history = []
-            st.session_state.view_session = None
-            _mark_sessions_dirty()
-            st.rerun()
+        if st.button("Xóa tất cả lịch sử", use_container_width=True):
+            _dialog_clear_all_history()
 
         st.markdown("")
         for sid, pdf_name, cnt, started in all_sessions:
             is_current = (sid == st.session_state.session_id)
-            badge      = " 🟢" if is_current else ""
+            badge      = "" if is_current else ""
             label      = f"📄 {pdf_name or 'Unknown'}{badge}"
             sub        = f"{cnt} câu · {started[:10]}"
             if st.button(f"{label} | {sub}", key=f"sess_{sid}", use_container_width=True):
@@ -261,49 +285,63 @@ st.markdown("""
 
 
 
-# ── Upload PDF ────────────────────────────────────────────────
+# ── Upload file ───────────────────────────────────────────────
+# Theo dõi tên file đang được xử lý để phát hiện khi user bấm × hoặc đổi file
 
 uploaded_file = st.file_uploader(
-    "📁 Kéo thả hoặc click để tải lên file (PDF hoặc DOCX - tối đa 20MB)",
-    type=["pdf", "docx"], #them xu ly file doc o day
+    "Kéo thả hoặc click để tải lên file (PDF hoặc DOCX - tối đa 20MB)",
+    type=["pdf", "docx"],
     help="Chỉ hỗ trợ file PDF và .docx",
+    key=f"uploader_{st.session_state.uploader_key}",
 )
 
 if uploaded_file is not None and uploaded_file.size > 20 * 1024 * 1024:
-    st.error("❌ File quá lớn! Vui lòng chọn file dưới 20MB.")
+    st.error("File quá lớn! Vui lòng chọn file dưới 20MB.")
     uploaded_file = None
 
+# Trường hợp 1: User bấm × xóa file khỏi uploader
+# → uploaded_file = None nhưng retriever vẫn còn → reset retriever về None
+if uploaded_file is None and st.session_state.retriever is not None:
+    st.session_state.retriever = None
+    st.session_state.pdf_info  = None
+    # KHÔNG xóa chat_history — lịch sử chat giữ nguyên
 
-#xu ly file khi ng dung upload va chua co retriever
-if uploaded_file is not None and st.session_state.retriever is None:
-    file_extension = uploaded_file.name.lower().split('.')[-1] # lấy đuôi file
-    with st.spinner(f"⏳ Đang xử lý tài liệu { file_extension.upper() }... vui lòng chờ"):
+# Trường hợp 2: Có file mới (hoặc file khác tên file cũ) → xử lý chunk
+current_file_name = st.session_state.pdf_info["name"] if st.session_state.pdf_info else None
+need_process = (
+    uploaded_file is not None
+    and (st.session_state.retriever is None or uploaded_file.name != current_file_name)
+)
+
+if need_process:
+    file_extension = uploaded_file.name.lower().split(".")[-1]
+    with st.spinner(f"Đang xử lý tài liệu {file_extension.upper()}... vui lòng chờ"):
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_extension}") as tmp:
             tmp.write(uploaded_file.read())
             tmp_path = tmp.name
         try:
-            embedder  = _cached_embedder()
+            embedder = _cached_embedder()
             if file_extension == "pdf":
                 retriever, num_pages, num_chunks = process_pdf(tmp_path, embedder)
-                file_type= "PDF"
+                file_type = "PDF"
             elif file_extension == "docx":
                 retriever, num_pages, num_chunks = process_docx(tmp_path, embedder)
-                file_type= "DOCX"
+                file_type = "DOCX"
             else:
                 st.error(f"Hệ thống hiện chưa hỗ trợ định dạng file {file_extension.upper()}")
-                retriever=None
+                retriever = None
 
-            if retriever:       
+            if retriever:
                 st.session_state.retriever = retriever
                 st.session_state.pdf_info  = {
                     "name":   uploaded_file.name,
-                    "type": file_type,
+                    "type":   file_type,
                     "pages":  num_pages,
                     "chunks": num_chunks,
                 }
                 _mark_sessions_dirty()
         except Exception as e:
-            st.error(f"❌ Lỗi xử lý file {file_extension.upper()}: {e}")
+            st.error(f"Lỗi xử lý file {file_extension.upper()}: {e}")
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
@@ -325,10 +363,11 @@ st.divider()
 # ── Chat area ─────────────────────────────────────────────────
 
 if st.session_state.view_session and st.session_state.view_session != st.session_state.session_id:
+    # Đang xem lịch sử session khác
     vs   = st.session_state.view_session
     hist = load_history(vs)
     if hist:
-        st.info(f"📖 Đang xem lịch sử session · {len(hist)} câu hỏi")
+        st.info(f"Đang xem lịch sử session · {len(hist)} câu hỏi")
         if st.button("← Quay lại session hiện tại"):
             st.session_state.view_session = None
             st.rerun()
@@ -340,10 +379,8 @@ if st.session_state.view_session and st.session_state.view_session != st.session
         st.warning("Không tìm thấy lịch sử cho session này.")
         st.session_state.view_session = None
 
-elif st.session_state.retriever is None:
-    st.info("💡 Vui lòng upload file PDF hoặc DOCX để bắt đầu hỏi đáp.")
-
 else:
+    # Session hiện tại — luôn hiển thị lịch sử chat dù có file hay không
     for item in st.session_state.chat_history:
         ts = item.get("timestamp", "")
         if ts:
@@ -351,33 +388,37 @@ else:
         with st.chat_message("user"):      st.write(item["question"])
         with st.chat_message("assistant"): st.write(item["answer"])
 
-    user_question = st.chat_input("Nhập câu hỏi của bạn về tài liệu...")
+    # Chat input chỉ hiện khi có tài liệu đang được load
+    if st.session_state.retriever is None:
+        st.info("💡 Upload file PDF hoặc DOCX để bắt đầu hỏi đáp.")
+    else:
+        user_question = st.chat_input("Nhập câu hỏi của bạn về tài liệu...")
 
-    if user_question:
-        with st.chat_message("user"):
-            st.write(user_question)
+        if user_question:
+            with st.chat_message("user"):
+                st.write(user_question)
 
-        # FIX LAG #3 — streaming: chữ hiện ra từng token, không chờ model xong
-        with st.chat_message("assistant"):
-            answer_placeholder = st.empty()
-            full_answer = ""
-            try:
-                for chunk in ask_question_stream(user_question, st.session_state.retriever):
-                    full_answer += chunk
-                    answer_placeholder.markdown(full_answer + "▌")   # con trỏ nhấp nháy
+            with st.chat_message("assistant"):
+                answer_placeholder = st.empty()
+                full_answer = ""
+                try:
+                    for chunk in ask_question_stream(user_question, st.session_state.retriever):
+                        full_answer += chunk
+                        answer_placeholder.markdown(full_answer + "▌")
 
-                answer_placeholder.markdown(full_answer)             # xóa con trỏ khi xong
+                    answer_placeholder.markdown(full_answer)
 
-                pdf_name = st.session_state.pdf_info["name"] if st.session_state.pdf_info else None
-                save_message(st.session_state.session_id, pdf_name, user_question, full_answer)
-                ts_now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                st.session_state.chat_history.append({
-                    "question":  user_question,
-                    "answer":    full_answer,
-                    "timestamp": ts_now,
-                })
-                _mark_sessions_dirty()
+                    pdf_name = st.session_state.pdf_info["name"] if st.session_state.pdf_info else None
+                    save_message(st.session_state.session_id, pdf_name, user_question, full_answer)
+                    ts_now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    st.session_state.chat_history.append({
+                        "question":  user_question,
+                        "answer":    full_answer,
+                        "timestamp": ts_now,
+                    })
+                    _mark_sessions_dirty()
+                    st.rerun()
 
-            except Exception as e:
-                answer_placeholder.error(f"❌ Lỗi khi gọi model: {e}")
-                st.caption("Kiểm tra Ollama đang chạy và model đã được pull chưa.")
+                except Exception as e:
+                    answer_placeholder.error(f"❌ Lỗi khi gọi model: {e}")
+                    st.caption("Kiểm tra Ollama đang chạy và model đã được pull chưa.")
