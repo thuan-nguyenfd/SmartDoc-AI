@@ -202,5 +202,20 @@ hr {
     font-size: 11px;
     background: transparent;
 }
+
+/* Thêm mũi tên xuống cho selectbox */
+    div[data-baseweb="select"] > div:first-child::after {
+        content: "▼";           /* hoặc dùng font-awesome nếu bạn import */
+        position: absolute;
+        right: 12px;
+        top: 50%;
+        transform: translateY(-50%);
+        pointer-events: none;
+        color: #666;
+        font-size: 12px;
+    }
+    
+    /* Làm cho vùng click dễ nhận biết hơn */
+   
 </style>
 """
