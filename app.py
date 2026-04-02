@@ -204,13 +204,13 @@ with st.sidebar:
     st.markdown("### Cài đặt")
 
     chunk_size = st.selectbox(
-        "Chunk Size",
+        "Chọn Chunk Size",
         [500, 1000, 1500, 2000],
         index=[500, 1000, 1500, 2000].index(st.session_state.chunk_size)
     )
 
     chunk_overlap = st.selectbox(
-        "Chunk Overlap",
+        "Chọn Chunk Overlap",
         [50, 100, 200],
         index=[50, 100, 200].index(st.session_state.chunk_overlap)
     )
