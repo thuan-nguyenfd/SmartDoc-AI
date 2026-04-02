@@ -39,8 +39,8 @@ except ImportError:
 CONFIG = {
     "embedding_model":  "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
     "embedding_device": "cpu",
-    "chunk_size":       1000,
-    "chunk_overlap":    100,
+    "chunk_size":       1000,   # default — bị override bởi tham số khi gọi process_pdf/process_docx
+    "chunk_overlap":    100,    # default — bị override bởi tham số khi gọi process_pdf/process_docx
     "retriever_k":      3,
     "llm_model":        "qwen2.5:7b",
     "llm_temperature":  0.7,
@@ -72,17 +72,18 @@ def get_embedder() -> HuggingFaceEmbeddings:
 # 2. XỬ LÝ TÀI LIỆU
 # ══════════════════════════════════════════════════════════════
 
-def process_pdf(file_path: str, embedder) -> tuple:
+def process_pdf(file_path: str, embedder, chunk_size: int = None, chunk_overlap: int = None) -> tuple:
     """
     Đọc PDF → chunk → FAISS → retriever.
 
+    chunk_size / chunk_overlap: nếu truyền vào thì dùng, ngược lại lấy từ CONFIG.
     Trả về: (retriever, num_pages, num_chunks)
     """
     loader   = PDFPlumberLoader(file_path)
     docs     = loader.load()
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CONFIG["chunk_size"],
-        chunk_overlap=CONFIG["chunk_overlap"],
+        chunk_size=chunk_size or CONFIG["chunk_size"],
+        chunk_overlap=chunk_overlap or CONFIG["chunk_overlap"],
     )
     chunks       = splitter.split_documents(docs)
     vector_store = FAISS.from_documents(chunks, embedder)
@@ -94,10 +95,11 @@ def process_pdf(file_path: str, embedder) -> tuple:
 
 
 # Câu 1 — hỗ trợ DOCX:
-def process_docx(file_path: str, embedder) -> tuple:
+def process_docx(file_path: str, embedder, chunk_size: int = None, chunk_overlap: int = None) -> tuple:
     """
     Đọc file DOCX → chunk → FAISS.
-    
+
+    chunk_size / chunk_overlap: nếu truyền vào thì dùng, ngược lại lấy từ CONFIG.
     Ước lượng số trang dựa trên tổng ký tự nội dung:
     - Trung bình 1 trang A4 ≈ 1800–2200 ký tự (font 12, giãn dòng 1.5)
     - Dùng 2000 ký tự/trang làm baseline, có thể chỉnh qua CHARS_PER_PAGE
@@ -111,8 +113,8 @@ def process_docx(file_path: str, embedder) -> tuple:
     docs   = loader.load()
 
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CONFIG["chunk_size"],
-        chunk_overlap=CONFIG["chunk_overlap"],
+        chunk_size=chunk_size or CONFIG["chunk_size"],
+        chunk_overlap=chunk_overlap or CONFIG["chunk_overlap"],
     )
     chunks = splitter.split_documents(docs)
 

@@ -83,7 +83,7 @@ if not st.session_state.chat_history:
 # CACHE FUNCTIONS
 # ══════════════════════════════════════════════════════════════
 
-@st.cache_resource(show_spinner="⏳ Đang tải embedding model...")
+@st.cache_resource(show_spinner="Đang tải embedding model...")
 def _cached_embedder():
     """Embedding model — tải 1 lần duy nhất suốt vòng đời server."""
     return get_embedder()
@@ -91,7 +91,7 @@ def _cached_embedder():
 
 def _get_ollama_status() -> bool:
     """
-    FIX LAG #1: Kiểm tra Ollama chỉ 1 lần rồi cache vào session_state.
+    Kiểm tra Ollama chỉ 1 lần rồi cache vào session_state.
     Không gọi network mỗi lần Streamlit rerun nữa.
     """
     if st.session_state.ollama_ok is None:
@@ -105,7 +105,7 @@ def _get_ollama_status() -> bool:
 
 def _get_sessions():
     """
-    FIX LAG #2: Cache danh sách sessions vào session_state.
+    Cache danh sách sessions vào session_state.
     Chỉ query SQLite khi sessions_dirty = True (sau khi xóa / thêm mới).
     """
     if st.session_state.sessions_dirty or st.session_state.sessions_cache is None:
@@ -123,7 +123,7 @@ def _mark_sessions_dirty():
 # CONFIRM DIALOGS
 # ══════════════════════════════════════════════════════════════
 
-@st.dialog("✨ Bắt đầu đoạn chat mới?")
+@st.dialog("Bắt đầu đoạn chat mới?")
 def _dialog_new_chat():
     st.caption("Chat hiện tại và tài liệu đang tải sẽ bị xóa. Lịch sử hội thoại vẫn được lưu lại.")
     col1, col2 = st.columns(2, gap="small")
@@ -143,7 +143,7 @@ def _dialog_new_chat():
             st.rerun()
     
 
-@st.dialog("🗑 Xóa tất cả lịch sử?")
+@st.dialog("Xóa tất cả lịch sử?")
 def _dialog_clear_all_history():
     st.warning("**Toàn bộ** lịch sử của mọi phiên sẽ bị xóa vĩnh viễn. Không thể hoàn tác.")
     col1, col2 = st.columns(2, gap="small")
@@ -158,7 +158,7 @@ def _dialog_clear_all_history():
         if st.button("Hủy", use_container_width=True):
             st.rerun()
 
-@st.dialog("🗑 Xóa tài liệu đang tải?")
+@st.dialog("Xóa tài liệu đang tải?")
 def _dialog_delete_pdf():
     info = st.session_state.pdf_info
     name = info["name"] if info else "tài liệu hiện tại"
@@ -194,20 +194,48 @@ with st.sidebar:
             """)
     st.divider()
 
-    from rag_engine import CONFIG as RAG_CONFIG
+    if "chunk_size" not in st.session_state:
+        st.session_state.chunk_size = 1000
+
+    if "chunk_overlap" not in st.session_state:
+        st.session_state.chunk_overlap = 100
+
+    # UI chọn
     st.markdown("### Cài đặt")
+
+    chunk_size = st.selectbox(
+        "Chunk Size",
+        [500, 1000, 1500, 2000],
+        index=[500, 1000, 1500, 2000].index(st.session_state.chunk_size)
+    )
+
+    chunk_overlap = st.selectbox(
+        "Chunk Overlap",
+        [50, 100, 200],
+        index=[50, 100, 200].index(st.session_state.chunk_overlap)
+    )
+
+    st.session_state.chunk_size = chunk_size
+    st.session_state.chunk_overlap = chunk_overlap
+
+    # Nếu đang có tài liệu và user thay đổi chunk params → yêu cầu re-process
+    if st.session_state.pdf_info:
+        prev_cs = st.session_state.pdf_info.get("chunk_size")
+        prev_co = st.session_state.pdf_info.get("chunk_overlap")
+        if prev_cs is not None and (prev_cs != chunk_size or prev_co != chunk_overlap):
+            st.warning("⚠️ Chunk params đã thay đổi. Hãy upload lại tài liệu để áp dụng.")
+
     st.markdown(f"""
-        <div class="setting-item"><span>Chunk Size</span><code>{RAG_CONFIG['chunk_size']}</code></div>
-        <div class="setting-item"><span>Chunk Overlap</span><code>{RAG_CONFIG['chunk_overlap']}</code></div>
-        <div class="setting-item"><span>Top K</span><code>{RAG_CONFIG['retriever_k']}</code></div>
-        <div class="setting-item"><span>Temperature</span><code>{RAG_CONFIG['llm_temperature']}</code></div>
-        <div class="setting-item"><span>Device</span><code>{RAG_CONFIG['embedding_device'].upper()}</code></div>
+        <div class="setting-item"><span>Chunk Size</span><code>{st.session_state.chunk_size}</code></div>
+        <div class="setting-item"><span>Chunk Overlap</span><code>{st.session_state.chunk_overlap}</code></div>
+        <div class="setting-item"><span>Top K</span>3</div>
     """, unsafe_allow_html=True)
+
     st.divider()
 
     st.markdown("### Model")
     st.markdown(f"""
-        <div class="setting-item"><span>LLM</span><code>{RAG_CONFIG['llm_model']}</code></div>
+        <div class="setting-item"><span>LLM</span><code>qwen2.5:7b</code></div>
         <div class="setting-item"><span>Embedding</span><code>mpnet-base-v2</code></div>
         <div class="setting-item"><span>Vector DB</span><code>FAISS</code></div>
         <div class="setting-item"><span>Framework</span><code>LangChain</code></div>
@@ -215,7 +243,7 @@ with st.sidebar:
 
     st.divider()
 
-    # FIX LAG #1 — dùng cached status, không gọi network mỗi rerun
+    # dùng cached status, không gọi network mỗi rerun
     if _get_ollama_status():
         st.success("🟢 Ollama đang chạy")
     else:
@@ -322,10 +350,18 @@ if need_process:
         try:
             embedder = _cached_embedder()
             if file_extension == "pdf":
-                retriever, num_pages, num_chunks = process_pdf(tmp_path, embedder)
+                retriever, num_pages, num_chunks = process_pdf(
+                    tmp_path, embedder,
+                    chunk_size=st.session_state.chunk_size,
+                    chunk_overlap=st.session_state.chunk_overlap,
+                )
                 file_type = "PDF"
             elif file_extension == "docx":
-                retriever, num_pages, num_chunks = process_docx(tmp_path, embedder)
+                retriever, num_pages, num_chunks = process_docx(
+                    tmp_path, embedder,
+                    chunk_size=st.session_state.chunk_size,
+                    chunk_overlap=st.session_state.chunk_overlap,
+                )
                 file_type = "DOCX"
             else:
                 st.error(f"Hệ thống hiện chưa hỗ trợ định dạng file {file_extension.upper()}")
@@ -334,10 +370,12 @@ if need_process:
             if retriever:
                 st.session_state.retriever = retriever
                 st.session_state.pdf_info  = {
-                    "name":   uploaded_file.name,
-                    "type":   file_type,
-                    "pages":  num_pages,
-                    "chunks": num_chunks,
+                    "name":         uploaded_file.name,
+                    "type":         file_type,
+                    "pages":        num_pages,
+                    "chunks":       num_chunks,
+                    "chunk_size":   st.session_state.chunk_size,
+                    "chunk_overlap": st.session_state.chunk_overlap,
                 }
                 _mark_sessions_dirty()
         except Exception as e:
@@ -354,6 +392,7 @@ if st.session_state.pdf_info:
         <span class="status-chip">{file_icon} {info['name']}</span>
         <span class="status-chip">📑 {info['pages']} trang</span>
         <span class="status-chip">🧩 {info['chunks']} chunks</span>
+        <span class="status-chip">✂️ size={info.get('chunk_size', '?')} / overlap={info.get('chunk_overlap', '?')}</span>
         <span class="status-chip ready">✅ FAISS Ready</span>
     </div>
     """, unsafe_allow_html=True)
@@ -390,7 +429,7 @@ else:
 
     # Chat input chỉ hiện khi có tài liệu đang được load
     if st.session_state.retriever is None:
-        st.info("💡 Upload file PDF hoặc DOCX để bắt đầu hỏi đáp.")
+        st.info("Upload file PDF hoặc DOCX để bắt đầu hỏi đáp.")
     else:
         user_question = st.chat_input("Nhập câu hỏi của bạn về tài liệu...")
 
@@ -420,5 +459,5 @@ else:
                     st.rerun()
 
                 except Exception as e:
-                    answer_placeholder.error(f"❌ Lỗi khi gọi model: {e}")
+                    answer_placeholder.error(f"Lỗi khi gọi model: {e}")
                     st.caption("Kiểm tra Ollama đang chạy và model đã được pull chưa.")
