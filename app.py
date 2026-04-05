@@ -17,7 +17,7 @@ import tempfile
 import urllib.request
 import uuid
 import datetime
-import math
+import json
 import streamlit as st
 
 from database import (
@@ -28,7 +28,7 @@ from database import (
     delete_session,
     clear_all_history,
 )
-from rag_engine import get_embedder, process_pdf, process_docx, ask_question_stream
+from rag_engine import get_embedder, process_pdf, process_docx, ask_question_stream, ask_question_stream_with_sources
 from styles import APP_CSS
 
 # ══════════════════════════════════════════════════════════════
@@ -76,7 +76,7 @@ if "session_id" not in st.session_state:
 if not st.session_state.chat_history:
     rows = load_history(st.session_state.session_id)
     st.session_state.chat_history = [
-        {"question": q, "answer": a, "timestamp": t} for q, a, t in rows
+        {"question": q, "answer": a, "sources": s, "timestamp": t} for q, a, s, t in rows
     ]
 
 # ══════════════════════════════════════════════════════════════
@@ -174,7 +174,54 @@ def _dialog_delete_pdf():
         if st.button("Hủy", use_container_width=True):
             st.rerun()
 
+def _highlight_text(content: str, question: str) -> str:
+    """
+    Highlight các từ khóa từ câu hỏi trong đoạn văn nguồn.
+    - Bỏ qua stop words tiếng Việt và tiếng Anh
+    - Dùng regex case-insensitive để tìm và bôi vàng
+    """
+    import re
+    STOP_WORDS = {
+        "là", "của", "và", "các", "có", "cho", "trong", "với", "về", "được",
+        "này", "đó", "khi", "nào", "như", "hay", "hoặc", "mô", "hình", "tôi",
+        "bạn", "hãy", "trình", "bày", "the", "of", "and", "for", "in", "is",
+        "to", "a", "an", "it", "on", "at", "by", "or", "be",
+    }
+    raw_tokens = re.findall(r'\w+', question, re.UNICODE)
+    keywords = [t for t in raw_tokens if len(t) > 2 and t.lower() not in STOP_WORDS]
+    if not keywords:
+        return content
+    safe_content = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    for kw in keywords:
+        pattern = re.compile(re.escape(kw), re.IGNORECASE | re.UNICODE)
+        safe_content = pattern.sub(
+            lambda m: f"<mark style='background:#FFD700;padding:1px 3px;"
+                      f"border-radius:3px;font-weight:600'>{m.group()}</mark>",
+            safe_content,
+        )
+    return safe_content
 
+
+def _render_sources(sources_data: list, question: str = ""):
+    """Render expander nguồn tham khảo — dùng chung cho chat mới và load history."""
+    if not sources_data:
+        return
+    with st.expander(f"📚 Nguồn tham khảo ({len(sources_data)} đoạn)"):
+        for src in sources_data:
+            page_display = src['page'] + 1 if isinstance(src['page'], int) else src['page']
+            file_name = src.get('source', '')
+            if file_name and ('\\' in file_name or '/' in file_name):
+                file_name = file_name.replace('\\\\', '/').replace('\\', '/').split('/')[-1]
+            st.markdown(f"**Đoạn {src['index']} — Trang {page_display}** · 📄 `{file_name}`")
+            highlighted = _highlight_text(src['content'], question) if question else \
+                src['content'].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            st.markdown(
+                f"<div style='background:#f8f9fa;border-left:3px solid #007BFF;"
+                f"padding:10px 14px;border-radius:4px;font-size:13px;"
+                f"line-height:1.6;white-space:pre-wrap'>{highlighted}</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown("")
 
 # ══════════════════════════════════════════════════════════════
 # SIDEBAR
@@ -211,8 +258,8 @@ with st.sidebar:
 
     chunk_overlap = st.selectbox(
         "Chọn Chunk Overlap",
-        [50, 100, 200],
-        index=[50, 100, 200].index(st.session_state.chunk_overlap)
+        [50, 100, 200, 300],
+        index=[50, 100, 200, 300].index(st.session_state.chunk_overlap)
     )
 
     st.session_state.chunk_size = chunk_size
@@ -228,7 +275,7 @@ with st.sidebar:
     st.markdown(f"""
         <div class="setting-item"><span>Chunk Size</span><code>{st.session_state.chunk_size}</code></div>
         <div class="setting-item"><span>Chunk Overlap</span><code>{st.session_state.chunk_overlap}</code></div>
-        <div class="setting-item"><span>Top K</span>3</div>
+        <div class="setting-item"><span>Top K</span>5</div>
     """, unsafe_allow_html=True)
 
     st.divider()
@@ -410,10 +457,14 @@ if st.session_state.view_session and st.session_state.view_session != st.session
         if st.button("← Quay lại session hiện tại"):
             st.session_state.view_session = None
             st.rerun()
-        for q, a, ts in hist:
+        for q, a, src_json, ts in hist:
             st.markdown(f"<small style='color:#6c757d'>🕐 {ts}</small>", unsafe_allow_html=True)
-            with st.chat_message("user"):      st.write(q)
-            with st.chat_message("assistant"): st.write(a)
+            with st.chat_message("user"):
+                st.write(q)
+            with st.chat_message("assistant"):
+                st.write(a)
+                sources = json.loads(src_json) if src_json else []
+                _render_sources(sources, question=q)
     else:
         st.warning("Không tìm thấy lịch sử cho session này.")
         st.session_state.view_session = None
@@ -424,8 +475,12 @@ else:
         ts = item.get("timestamp", "")
         if ts:
             st.markdown(f"<small style='color:#6c757d'>🕐 {ts}</small>", unsafe_allow_html=True)
-        with st.chat_message("user"):      st.write(item["question"])
-        with st.chat_message("assistant"): st.write(item["answer"])
+        with st.chat_message("user"):
+            st.write(item["question"])
+        with st.chat_message("assistant"):
+            st.write(item["answer"])
+            sources = json.loads(item["sources"]) if item.get("sources") else []
+            _render_sources(sources, question=item["question"])
 
     # Chat input chỉ hiện khi có tài liệu đang được load
     if st.session_state.retriever is None:
@@ -436,23 +491,30 @@ else:
         if user_question:
             with st.chat_message("user"):
                 st.write(user_question)
-
+            full_answer= ""
+            sources_data=[]
             with st.chat_message("assistant"):
                 answer_placeholder = st.empty()
-                full_answer = ""
+               # full_answer = ""
                 try:
-                    for chunk in ask_question_stream(user_question, st.session_state.retriever):
+                    for chunk in ask_question_stream_with_sources(user_question, st.session_state.retriever):
+                        if chunk.startswith("@@SOURCES@@"):
+                            sources_data = json.loads(chunk[len("@@SOURCES@@"):])
+                            continue  # ko render ra giao dien
                         full_answer += chunk
                         answer_placeholder.markdown(full_answer + "▌")
 
                     answer_placeholder.markdown(full_answer)
 
+                    _render_sources(sources_data, question=user_question)
+
                     pdf_name = st.session_state.pdf_info["name"] if st.session_state.pdf_info else None
-                    save_message(st.session_state.session_id, pdf_name, user_question, full_answer)
+                    save_message(st.session_state.session_id, pdf_name, user_question, full_answer, sources=sources_data)
                     ts_now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     st.session_state.chat_history.append({
                         "question":  user_question,
                         "answer":    full_answer,
+                        "sources":   json.dumps(sources_data, ensure_ascii=False) if sources_data else None,
                         "timestamp": ts_now,
                     })
                     _mark_sessions_dirty()

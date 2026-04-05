@@ -35,13 +35,12 @@ except ImportError:
     from langchain_community.embeddings import HuggingFaceEmbeddings
 
 # ── Cấu hình tập trung ────────────────────────────────────────
-# Câu 4: Muốn thử chunk_size / overlap khác → chỉ cần sửa ở đây
 CONFIG = {
     "embedding_model":  "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
     "embedding_device": "cpu",
     "chunk_size":       1000,   # default — bị override bởi tham số khi gọi process_pdf/process_docx
     "chunk_overlap":    100,    # default — bị override bởi tham số khi gọi process_pdf/process_docx
-    "retriever_k":      3,
+    "retriever_k":      5,
     "llm_model":        "qwen2.5:7b",
     "llm_temperature":  0.7,
     "ollama_host":      os.environ.get("OLLAMA_HOST", "http://localhost:11434"),
@@ -255,3 +254,40 @@ def ask_question(question: str, retriever) -> str:
     Dùng khi cần kết quả hoàn chỉnh, ví dụ: viết test, batch processing.
     """
     return "".join(ask_question_stream(question, retriever))
+
+#xu ly cho cau 5
+def ask_question_stream_with_sources(question: str, retriever, file_name: str = None) -> Generator[str,None, None]:
+    """
+    Giống ask_question_stream nhưng sau khi stream xong,
+    yield thêm 1 item đặc biệt chứa source metadata.
+    
+    Convention: item cuối cùng bắt đầu bằng "@@SOURCES@@"
+    app.py sẽ detect prefix này để tách ra xử lý riêng. 
+    """
+    lang = _detect_language(question)
+    prompt = _build_prompt(lang)
+    #lay source doc co metadata
+    source_docs=retriever.invoke(question)
+    context = "\n\n".join(d.page_content for d in source_docs)
+
+    filled_prompt = prompt.format(context=context, question=question)
+    llm= Ollama(
+        model= CONFIG["llm_model"],
+        base_url= CONFIG["ollama_host"],
+        temperature=CONFIG["llm_temperature"],
+    )
+    #stream
+    for chunk in llm.stream(filled_prompt):
+        yield chunk
+     #Sau khi stream xong, đóng gói source info thành JSON
+    import json
+    sources=[]
+    for i , doc in enumerate(source_docs):
+        meta = doc.metadata # metadata la cai luu page,source
+        sources.append({
+            "index": i+1,
+            "page": meta.get("page", "?"), #so trang
+            "source":  file_name or os.path.basename(meta.get("source", "unknown")), #duong dan file
+            "content": doc.page_content, #doan van goc
+        })
+    yield "@@SOURCES@@" + json.dumps(sources, ensure_ascii=False)

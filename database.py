@@ -17,6 +17,7 @@ DB_PATH = "chat_history.db"
 def init_db():
     """
     Khởi tạo database và tạo bảng conversations nếu chưa có.
+    Tự động migration: thêm cột sources nếu DB cũ chưa có.
     Gọi hàm này 1 lần duy nhất khi app khởi động (ở app.py).
     """
     conn = sqlite3.connect(DB_PATH)
@@ -28,14 +29,22 @@ def init_db():
             pdf_name  TEXT,
             question  TEXT NOT NULL,
             answer    TEXT NOT NULL,
+            sources   TEXT,
             timestamp TEXT NOT NULL
         )
     """)
+
+    # Migration: thêm cột sources nếu DB cũ chưa có
+    # ALTER TABLE không báo lỗi nếu đã có nhờ try/except
+    existing_cols = [row[1] for row in c.execute("PRAGMA table_info(conversations)")]
+    if "sources" not in existing_cols:
+        c.execute("ALTER TABLE conversations ADD COLUMN sources TEXT")
+
     conn.commit()
     conn.close()
 
 
-def save_message(session_id: str, pdf_name: str, question: str, answer: str):
+def save_message(session_id: str, pdf_name: str, question: str, answer: str, sources=None):
     """
     Lưu một cặp Q&A vào SQLite.
 
@@ -45,15 +54,17 @@ def save_message(session_id: str, pdf_name: str, question: str, answer: str):
         question   : Câu hỏi của người dùng
         answer     : Câu trả lời từ LLM
     """
+    import json
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "INSERT INTO conversations (session, pdf_name, question, answer, timestamp) VALUES (?,?,?,?,?)",
+        "INSERT INTO conversations (session, pdf_name, question, answer,sources, timestamp) VALUES (?,?,?,?,?,?)",
         (
             session_id,
             pdf_name,
             question,
             answer,
+            json.dumps(sources, ensure_ascii=False) if sources else None,
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         ),
     )
@@ -71,7 +82,7 @@ def load_history(session_id: str) -> list[tuple]:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "SELECT question, answer, timestamp FROM conversations WHERE session=? ORDER BY id",
+        "SELECT question, answer,sources, timestamp FROM conversations WHERE session=? ORDER BY id",
         (session_id,),
     )
     rows = c.fetchall()
