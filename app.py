@@ -28,7 +28,7 @@ from database import (
     delete_session,
     clear_all_history,
 )
-from rag_engine import get_embedder, process_pdf, process_docx, ask_question_stream, ask_question_stream_with_sources
+from rag_engine import get_embedder, process_pdf, process_docx, ask_question_stream_with_sources
 from styles import APP_CSS
 
 # ══════════════════════════════════════════════════════════════
@@ -55,14 +55,14 @@ st.markdown(APP_CSS, unsafe_allow_html=True)
 # ══════════════════════════════════════════════════════════════
 
 _defaults = {
-    "retriever":        None,
-    "chat_history":     [],
-    "pdf_info":         None,
-    "view_session":     None,
-    "ollama_ok":        None,   # None = chưa check, True/False = kết quả
-    "sessions_cache":   None,   # cache load_all_sessions()
-    "sessions_dirty":   True,   # True = cần reload từ DB
-    "uploader_key":       0,
+    "retriever": None,
+    "chat_history": [],
+    "pdf_info": None,
+    "view_session": None,
+    "ollama_ok": None,  # None = chưa check, True/False = kết quả
+    "sessions_cache": None,  # cache load_all_sessions()
+    "sessions_dirty": True,  # True = cần reload từ DB
+    "uploader_key": 0,
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -78,6 +78,7 @@ if not st.session_state.chat_history:
     st.session_state.chat_history = [
         {"question": q, "answer": a, "sources": s, "timestamp": t} for q, a, s, t in rows
     ]
+
 
 # ══════════════════════════════════════════════════════════════
 # CACHE FUNCTIONS
@@ -130,10 +131,10 @@ def _dialog_new_chat():
     with col1:
         if st.button("Đồng ý", type="primary", use_container_width=True):
             # Tạo session_id mới → đoạn chat hoàn toàn mới
-            st.session_state.session_id   = str(uuid.uuid4())[:8]
+            st.session_state.session_id = str(uuid.uuid4())[:8]
             st.session_state.chat_history = []
-            st.session_state.retriever    = None
-            st.session_state.pdf_info     = None
+            st.session_state.retriever = None
+            st.session_state.pdf_info = None
             st.session_state.view_session = None
             st.session_state.uploader_key += 1
             _mark_sessions_dirty()
@@ -141,7 +142,7 @@ def _dialog_new_chat():
     with col2:
         if st.button("Hủy", type="secondary", use_container_width=True):
             st.rerun()
-    
+
 
 @st.dialog("Xóa tất cả lịch sử?")
 def _dialog_clear_all_history():
@@ -158,6 +159,7 @@ def _dialog_clear_all_history():
         if st.button("Hủy", use_container_width=True):
             st.rerun()
 
+
 @st.dialog("Xóa tài liệu đang tải?")
 def _dialog_delete_pdf():
     info = st.session_state.pdf_info
@@ -167,12 +169,13 @@ def _dialog_delete_pdf():
     with col1:
         if st.button("Xác nhận", type="primary", use_container_width=True):
             st.session_state.uploader_key += 1
-            st.session_state.retriever    = None
-            st.session_state.pdf_info     = None
+            st.session_state.retriever = None
+            st.session_state.pdf_info = None
             st.rerun()
     with col2:
         if st.button("Hủy", use_container_width=True):
             st.rerun()
+
 
 def _highlight_text(content: str, question: str) -> str:
     """
@@ -223,6 +226,7 @@ def _render_sources(sources_data: list, question: str = ""):
             )
             st.markdown("")
 
+
 # ══════════════════════════════════════════════════════════════
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════
@@ -250,6 +254,34 @@ with st.sidebar:
     # UI chọn
     st.markdown("### Cài đặt")
 
+    use_rerank = st.checkbox(
+        "Bật Re-ranking (Cross-Encoder)",
+        value=st.session_state.get("use_rerank", False)
+    )
+    st.session_state.use_rerank = use_rerank
+    from rag_engine import CONFIG
+    CONFIG["use_rerank"] = st.session_state.use_rerank
+
+    rag_mode = st.radio(
+        "Chọn RAG:",
+        ["Basic RAG", "Self-RAG"],
+        index=0 if st.session_state.get("rag_mode", "basic") == "basic" else 1,
+        horizontal = True
+    )
+    st.session_state.rag_mode = rag_mode
+    from rag_engine import CONFIG
+    CONFIG["use_self_rag"] = (st.session_state.rag_mode == "Self-RAG")
+
+    selected_file = "All"
+    if st.session_state.pdf_info:
+        selected_file = st.selectbox(
+            "Filter theo tài liệu",
+            ["All"] + st.session_state.pdf_info["names"]
+        )
+    st.session_state.selected_file = selected_file
+    from rag_engine import CONFIG
+    CONFIG["selected_file"] = selected_file
+
     chunk_size = st.selectbox(
         "Chọn Chunk Size",
         [500, 1000, 1500, 2000],
@@ -273,6 +305,7 @@ with st.sidebar:
             st.warning("⚠️ Chunk params đã thay đổi. Hãy upload lại tài liệu để áp dụng.")
 
     st.markdown(f"""
+        <div class="setting-item"><span>Filter</span><code>{st.session_state.selected_file}</code></div>
         <div class="setting-item"><span>Chunk Size</span><code>{st.session_state.chunk_size}</code></div>
         <div class="setting-item"><span>Chunk Overlap</span><code>{st.session_state.chunk_overlap}</code></div>
         <div class="setting-item"><span>Top K</span>5</div>
@@ -282,7 +315,7 @@ with st.sidebar:
 
     st.markdown("### Model")
     st.markdown(f"""
-        <div class="setting-item"><span>LLM</span><code>qwen2.5:7b</code></div>
+        <div class="setting-item"><span>LLM</span><code>qwen2.5:1.5b</code></div>
         <div class="setting-item"><span>Embedding</span><code>mpnet-base-v2</code></div>
         <div class="setting-item"><span>Vector DB</span><code>FAISS</code></div>
         <div class="setting-item"><span>Framework</span><code>LangChain</code></div>
@@ -306,10 +339,10 @@ with st.sidebar:
     with col1:
         if st.button("New chat", use_container_width=True):
             # Tạo session_id mới → đoạn chat hoàn toàn mới
-            st.session_state.session_id   = str(uuid.uuid4())[:8]
+            st.session_state.session_id = str(uuid.uuid4())[:8]
             st.session_state.chat_history = []
-            st.session_state.retriever    = None
-            st.session_state.pdf_info     = None
+            st.session_state.retriever = None
+            st.session_state.pdf_info = None
             st.session_state.view_session = None
             st.session_state.uploader_key += 1
             _mark_sessions_dirty()
@@ -320,7 +353,7 @@ with st.sidebar:
             _dialog_delete_pdf()
     st.divider()
 
-    #lich su hoi thoai
+    # lich su hoi thoai
     st.markdown("### Lịch sử hội thoại")
     all_sessions = _get_sessions()
 
@@ -333,9 +366,9 @@ with st.sidebar:
         st.markdown("")
         for sid, pdf_name, cnt, started in all_sessions:
             is_current = (sid == st.session_state.session_id)
-            badge      = "" if is_current else ""
-            label      = f"📄 {pdf_name or 'Unknown'}{badge}"
-            sub        = f"{cnt} câu · {started[:10]}"
+            badge = "" if is_current else ""
+            label = f"📄 {pdf_name or 'Unknown'}{badge}"
+            sub = f"{cnt} câu · {started[:10]}"
             if st.button(f"{label} | {sub}", key=f"sess_{sid}", use_container_width=True):
                 st.session_state.view_session = sid
                 st.rerun()
@@ -355,94 +388,127 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-
- 
-
-
-
 # ── Upload file ───────────────────────────────────────────────
 # Theo dõi tên file đang được xử lý để phát hiện khi user bấm × hoặc đổi file
 
-uploaded_file = st.file_uploader(
+uploaded_files = st.file_uploader(
     "Kéo thả hoặc click để tải lên file (PDF hoặc DOCX - tối đa 20MB)",
     type=["pdf", "docx"],
     help="Chỉ hỗ trợ file PDF và .docx",
     key=f"uploader_{st.session_state.uploader_key}",
+    accept_multiple_files=True,
 )
 
-if uploaded_file is not None and uploaded_file.size > 20 * 1024 * 1024:
-    st.error("File quá lớn! Vui lòng chọn file dưới 20MB.")
-    uploaded_file = None
+if uploaded_files:
+    for file in uploaded_files:
+        if file.size > 20 * 1024 * 1024:
+            st.error("File quá lớn! Vui lòng chọn file dưới 20MB.")
+            st.stop()
 
 # Trường hợp 1: User bấm × xóa file khỏi uploader
 # → uploaded_file = None nhưng retriever vẫn còn → reset retriever về None
-if uploaded_file is None and st.session_state.retriever is not None:
+if not uploaded_files and st.session_state.retriever is not None:
     st.session_state.retriever = None
-    st.session_state.pdf_info  = None
+    st.session_state.documents = []
     # KHÔNG xóa chat_history — lịch sử chat giữ nguyên
 
 # Trường hợp 2: Có file mới (hoặc file khác tên file cũ) → xử lý chunk
-current_file_name = st.session_state.pdf_info["name"] if st.session_state.pdf_info else None
+current_files = st.session_state.pdf_info.get("names", []) if st.session_state.pdf_info else []
+
+new_files = [f.name for f in uploaded_files] if uploaded_files else []
+
 need_process = (
-    uploaded_file is not None
-    and (st.session_state.retriever is None or uploaded_file.name != current_file_name)
+    uploaded_files
+    and (st.session_state.retriever is None or set(new_files) != set(current_files))
 )
-
+#with st.spinner(f"Đang xử lý tài liệu {ext.upper()}... vui lòng chờ"):
 if need_process:
-    file_extension = uploaded_file.name.lower().split(".")[-1]
-    with st.spinner(f"Đang xử lý tài liệu {file_extension.upper()}... vui lòng chờ"):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_extension}") as tmp:
-            tmp.write(uploaded_file.read())
-            tmp_path = tmp.name
-        try:
-            embedder = _cached_embedder()
-            if file_extension == "pdf":
-                retriever, num_pages, num_chunks = process_pdf(
-                    tmp_path, embedder,
-                    chunk_size=st.session_state.chunk_size,
-                    chunk_overlap=st.session_state.chunk_overlap,
-                )
-                file_type = "PDF"
-            elif file_extension == "docx":
-                retriever, num_pages, num_chunks = process_docx(
-                    tmp_path, embedder,
-                    chunk_size=st.session_state.chunk_size,
-                    chunk_overlap=st.session_state.chunk_overlap,
-                )
-                file_type = "DOCX"
-            else:
-                st.error(f"Hệ thống hiện chưa hỗ trợ định dạng file {file_extension.upper()}")
-                retriever = None
 
-            if retriever:
-                st.session_state.retriever = retriever
-                st.session_state.pdf_info  = {
-                    "name":         uploaded_file.name,
-                    "type":         file_type,
-                    "pages":        num_pages,
-                    "chunks":       num_chunks,
-                    "chunk_size":   st.session_state.chunk_size,
-                    "chunk_overlap": st.session_state.chunk_overlap,
-                }
-                _mark_sessions_dirty()
-        except Exception as e:
-            st.error(f"Lỗi xử lý file {file_extension.upper()}: {e}")
-        finally:
-            if os.path.exists(tmp_path):
+    file_names = ", ".join([f.name for f in uploaded_files])
+
+    with st.spinner(f"Đang xử lý {len(uploaded_files)} file: {file_names} ..."):
+
+        all_chunks = []
+        file_metadata = []
+        embedder = _cached_embedder()
+
+        for file in uploaded_files:
+            ext = file.name.lower().split(".")[-1]
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
+                tmp.write(file.read())
+                tmp_path = tmp.name
+
+            try:
+                with st.spinner(f"→ Đang xử lý {file.name}..."):
+
+                    if ext == "pdf":
+                        chunks, pages, num_chunks = process_pdf(
+                            tmp_path, embedder,
+                            chunk_size=st.session_state.chunk_size,
+                            chunk_overlap=st.session_state.chunk_overlap,
+                        )
+
+
+                    elif ext == "docx":
+                        chunks, pages, num_chunks = process_docx(
+                            tmp_path, embedder,
+                            chunk_size=st.session_state.chunk_size,
+                            chunk_overlap=st.session_state.chunk_overlap,
+                        )
+
+                    else:
+                        continue
+
+                    # ✅ GẮN METADATA
+                    for chunk in chunks:
+                        chunk.metadata["source"] = file.name
+                        chunk.metadata["file_type"] = ext
+                        chunk.metadata["upload_time"] = str(datetime.datetime.now())
+
+                    all_chunks.extend(chunks)
+                    del chunks
+                    file_metadata.append({
+                        "name": file.name,
+                        "pages": pages,
+                        "chunks": num_chunks
+                    })
+
+            finally:
                 os.unlink(tmp_path)
 
+        from rag_engine import build_hybrid_retriever
+
+        retriever = build_hybrid_retriever(all_chunks, embedder)
+        st.session_state.retriever = retriever
+
+        del all_chunks
+
+        # ✅ LƯU METADATA
+        st.session_state.pdf_info = {
+            "names": [f["name"] for f in file_metadata],
+            "files": file_metadata
+        }
+
+        # 👉 thêm để fix lỗi UI
+        st.session_state.documents = file_metadata
+
+        _mark_sessions_dirty()
+
 if st.session_state.pdf_info:
-    info = st.session_state.pdf_info
-    file_icon = "📄" if info.get("type") == "PDF" else "📝"
-    st.markdown(f"""
-    <div class="status-row">
-        <span class="status-chip">{file_icon} {info['name']}</span>
-        <span class="status-chip">📑 {info['pages']} trang</span>
-        <span class="status-chip">🧩 {info['chunks']} chunks</span>
-        <span class="status-chip">✂️ size={info.get('chunk_size', '?')} / overlap={info.get('chunk_overlap', '?')}</span>
-        <span class="status-chip ready">✅ FAISS Ready</span>
-    </div>
-    """, unsafe_allow_html=True)
+    if st.session_state.documents:
+        st.markdown("### 📂 Tài liệu đã tải")
+
+        for doc in st.session_state.documents:
+            file_icon = "📄" if doc["name"].lower().endswith(".pdf") else "📝"
+
+            st.markdown(f"""
+            <div class="status-row">
+                <span class="status-chip">{file_icon} {doc['name']}</span>
+                <span class="status-chip">📑 {doc['pages']} trang</span>
+                <span class="status-chip">🧩 {doc['chunks']} chunks</span>
+            </div>
+            """, unsafe_allow_html=True)
 
 st.divider()
 
@@ -450,7 +516,7 @@ st.divider()
 
 if st.session_state.view_session and st.session_state.view_session != st.session_state.session_id:
     # Đang xem lịch sử session khác
-    vs   = st.session_state.view_session
+    vs = st.session_state.view_session
     hist = load_history(vs)
     if hist:
         st.info(f"Đang xem lịch sử session · {len(hist)} câu hỏi")
@@ -491,13 +557,21 @@ else:
         if user_question:
             with st.chat_message("user"):
                 st.write(user_question)
-            full_answer= ""
-            sources_data=[]
+            full_answer = ""
+            sources_data = []
             with st.chat_message("assistant"):
                 answer_placeholder = st.empty()
-               # full_answer = ""
+                # full_answer = ""
                 try:
-                    for chunk in ask_question_stream_with_sources(user_question, st.session_state.retriever):
+                    for chunk in ask_question_stream_with_sources(
+                            user_question,
+                            st.session_state.retriever,
+                            chat_history=st.session_state.chat_history
+                    ):
+                        if chunk.startswith("@@CONFIDENCE@@"):
+                            score = float(chunk.replace("@@CONFIDENCE@@", ""))
+                            st.caption(f"🎯 Confidence: {score:.2f}")
+                            continue
                         if chunk.startswith("@@SOURCES@@"):
                             sources_data = json.loads(chunk[len("@@SOURCES@@"):])
                             continue  # ko render ra giao dien
@@ -508,13 +582,14 @@ else:
 
                     _render_sources(sources_data, question=user_question)
 
-                    pdf_name = st.session_state.pdf_info["name"] if st.session_state.pdf_info else None
-                    save_message(st.session_state.session_id, pdf_name, user_question, full_answer, sources=sources_data)
+                    pdf_name = ", ".join(st.session_state.pdf_info["names"]) if st.session_state.pdf_info else None
+                    save_message(st.session_state.session_id, pdf_name, user_question, full_answer,
+                                 sources=sources_data)
                     ts_now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     st.session_state.chat_history.append({
-                        "question":  user_question,
-                        "answer":    full_answer,
-                        "sources":   json.dumps(sources_data, ensure_ascii=False) if sources_data else None,
+                        "question": user_question,
+                        "answer": full_answer,
+                        "sources": json.dumps(sources_data, ensure_ascii=False) if sources_data else None,
                         "timestamp": ts_now,
                     })
                     _mark_sessions_dirty()
