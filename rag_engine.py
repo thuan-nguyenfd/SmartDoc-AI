@@ -37,12 +37,12 @@ except ImportError:
 
 # ── Cấu hình tập trung ────────────────────────────────────────
 CONFIG = {
-    "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+    "embedding_model": "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
     "embedding_device": "cpu",
     "chunk_size": 1000,  # default — bị override bởi tham số khi gọi process_pdf/process_docx
     "chunk_overlap": 100,  # default — bị override bởi tham số khi gọi process_pdf/process_docx
     "retriever_k": 3,
-    "llm_model": "qwen2.5:1.5b",
+    "llm_model": "qwen2.5:3b",
     "llm_temperature": 0.3,
     "ollama_host": os.environ.get("OLLAMA_HOST", "http://localhost:11434"),
     "use_rerank": False,
@@ -92,7 +92,7 @@ def process_pdf(file_path: str, embedder, chunk_size: int = None, chunk_overlap:
     Đọc PDF → chunk → FAISS → retriever.
 
     chunk_size / chunk_overlap: nếu truyền vào thì dùng, ngược lại lấy từ CONFIG.
-    Trả về: (retriever, num_pages, num_chunks)
+     Trả về: (chunks, num_pages, num_chunks)
     """
     loader = PDFPlumberLoader(file_path)
     docs = loader.load()
@@ -293,7 +293,7 @@ def ask_question_stream_with_sources(question: str, retriever, chat_history: lis
     prompt = _build_prompt(lang)
     history_text = _format_chat_history(chat_history or [])
     # lay source doc co metadata
-    source_docs = retriever.invoke(question)[:10]
+    source_docs = retriever.invoke(question)[:CONFIG["retriever_k"]]
 
     selected_file = CONFIG.get("selected_file", "All")
 

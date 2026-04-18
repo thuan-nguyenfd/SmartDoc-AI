@@ -293,9 +293,22 @@ with st.sidebar:
         [50, 100, 200, 300],
         index=[50, 100, 200, 300].index(st.session_state.chunk_overlap)
     )
+    if "top_k" not in st.session_state:
+        st.session_state.top_k = 5
+
+    top_k = st.selectbox(
+        "Chọn Top K (số đoạn retrieve)",
+        [3, 5, 7, 10],
+        index=[3, 5, 7, 10].index(st.session_state.top_k)
+    )
 
     st.session_state.chunk_size = chunk_size
     st.session_state.chunk_overlap = chunk_overlap
+    st.session_state.top_k = top_k
+
+    # Cập nhật CONFIG ngay khi user thay đổi
+    from rag_engine import CONFIG
+    CONFIG["retriever_k"] = st.session_state.top_k
 
     # Nếu đang có tài liệu và user thay đổi chunk params → yêu cầu re-process
     if st.session_state.pdf_info:
@@ -308,14 +321,14 @@ with st.sidebar:
         <div class="setting-item"><span>Filter</span><code>{st.session_state.selected_file}</code></div>
         <div class="setting-item"><span>Chunk Size</span><code>{st.session_state.chunk_size}</code></div>
         <div class="setting-item"><span>Chunk Overlap</span><code>{st.session_state.chunk_overlap}</code></div>
-        <div class="setting-item"><span>Top K</span>5</div>
+        <div class="setting-item"><span>Top K</span><code>{st.session_state.top_k}</code></div>
     """, unsafe_allow_html=True)
 
     st.divider()
 
     st.markdown("### Model")
     st.markdown(f"""
-        <div class="setting-item"><span>LLM</span><code>qwen2.5:1.5b</code></div>
+        <div class="setting-item"><span>LLM</span><code>qwen2.5:5b</code></div>
         <div class="setting-item"><span>Embedding</span><code>mpnet-base-v2</code></div>
         <div class="setting-item"><span>Vector DB</span><code>FAISS</code></div>
         <div class="setting-item"><span>Framework</span><code>LangChain</code></div>
@@ -561,6 +574,7 @@ else:
             sources_data = []
             with st.chat_message("assistant"):
                 answer_placeholder = st.empty()
+                answer_placeholder.markdown("Đang tìm câu trả lời...")
                 # full_answer = ""
                 try:
                     for chunk in ask_question_stream_with_sources(
@@ -570,7 +584,7 @@ else:
                     ):
                         if chunk.startswith("@@CONFIDENCE@@"):
                             score = float(chunk.replace("@@CONFIDENCE@@", ""))
-                            st.caption(f"🎯 Confidence: {score:.2f}")
+                            st.caption(f" Confidence: {score:.2f}")
                             continue
                         if chunk.startswith("@@SOURCES@@"):
                             sources_data = json.loads(chunk[len("@@SOURCES@@"):])
