@@ -800,29 +800,10 @@ def self_rag_pipeline(question, retriever, chat_history=None):
 
     for _ in range(CONFIG["self_rag_max_iter"]):
         new_query = rewrite_query(question, history_text)
+        docs = retriever.invoke(new_query)[:10]
 
-        # ====================== ĐỒNG BỘ VỚI RAG THƯỜNG ======================
-        # 1. Lấy đủ candidates (top-20) để rerank
-        retrieved_docs = retriever.invoke(new_query)[:20]
-
-        # 2. Áp dụng filter selected_file (nếu người dùng chọn 1 file cụ thể)
-        selected_file = CONFIG.get("selected_file", "All")
-        if selected_file != "All":
-            retrieved_docs = [
-                d for d in retrieved_docs 
-                if d.metadata.get("source") == selected_file
-            ]
-
-        # 3. Rerank hoặc lấy đúng top-k theo giao diện
         if CONFIG.get("use_rerank", False):
-            docs = rerank_documents(
-                new_query, 
-                retrieved_docs, 
-                top_k=CONFIG["retriever_k"]
-            )
-        else:
-            docs = retrieved_docs[:CONFIG["retriever_k"]]
-
+            docs = rerank_documents(new_query, docs)
 
         context = "\n\n".join(d.page_content for d in docs)
         prompt = _build_prompt(_detect_language(question))
