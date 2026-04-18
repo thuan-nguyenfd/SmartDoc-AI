@@ -170,7 +170,7 @@ def _highlight_text(content: str, question: str) -> str:
 def _render_sources(sources_data: list, question: str = "", key_prefix: str = ""):
     if not sources_data:
         return
-    with st.expander(f"📚 Nguồn tham khảo ({len(sources_data)} đoạn)"):
+    with st.expander(f"📄 Nguồn tham khảo ({len(sources_data)} đoạn)"):
         for src in sources_data:
             page_display = src['page'] + 1 if isinstance(src['page'], int) else src['page']
             file_name = src.get('source', '')
@@ -301,7 +301,7 @@ with st.sidebar:
     else:
         st.error("🔴 Ollama chưa kết nối")
         st.caption(f"Host: `{OLLAMA_HOST}`")
-        if st.button("🔄 Kiểm tra lại"):
+        if st.button("Kiểm tra lại"):
             st.session_state.ollama_ok = None
             st.rerun()
 
