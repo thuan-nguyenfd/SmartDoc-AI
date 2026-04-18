@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import numpy as np
 import networkx as nx
 from typing import Generator
 
@@ -128,107 +129,127 @@ def build_hybrid_retriever(chunks, embedder):
 
 
 # ══════════════════════════════════════════════════════════════
-# 3. GRAPH RAG — Xây đồ thị thực thể
+# 3. GRAPH RAG — Xây đồ thị thực thể bằng LLM + Embedding Retrieval
 # ══════════════════════════════════════════════════════════════
 
-def _extract_entities_simple(text: str) -> list[str]:
+def _extract_entities_and_relations_llm(text: str, llm) -> list[dict]:
     """
-    Trích xuất thực thể từ text — generic, hỗ trợ mọi lĩnh vực.
+    Dùng LLM (Qwen) để trích xuất entities và relationships có ngữ nghĩa thực sự.
 
-    Chiến lược 2 lớp (bỏ hardcode domain-specific):
-      1. Acronym / Title Case tiếng Anh — bắt tên riêng, viết tắt
-      2. N-gram động (bigram + trigram) — bắt cụm khái niệm bất kỳ
-         trong văn bản, không phụ thuộc lĩnh vực
+    Trả về list of {"e1": str, "rel": str, "e2": str}
+    Ví dụ: {"e1": "FAISS", "rel": "lưu trữ", "e2": "vector embeddings"}
+
+    Fallback về regex nếu LLM parse thất bại.
     """
-    entities = set()
-    text_lower = text.lower()
+    prompt = f"""Extract key entities and their relationships from the text below.
+Return ONLY a JSON array, no explanation, no markdown.
+Format: [{{"e1": "entity1", "rel": "relationship", "e2": "entity2"}}]
+Rules:
+- e1 and e2 must be specific concepts, tools, methods, or named things (not generic words)
+- rel must be a short verb phrase describing how e1 relates to e2
+- Extract 3 to 8 relationships maximum
+- If text is in Vietnamese, keep entities in Vietnamese
 
-    # ── Lớp 1: Tiếng Anh — Acronym & Title Case ─────────────
-    acronyms = re.findall(r'\b[A-Z]{2,}\b', text)
-    entities.update(acronyms)
+Text:
+{text[:600]}
 
-    title_case = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', text)
-    entities.update(title_case)
-
-    # ── Lớp 2: N-gram động (bigram + trigram) ────────────────
-    # Giữ nguyên dấu tiếng Việt
-    words = re.findall(r'[\w\u00C0-\u024F\u1E00-\u1EFF]+', text_lower)
-
-    _STOP = {
-        # Tiếng Việt — stop words phổ biến
-        "là", "của", "và", "các", "có", "cho", "trong", "với", "về",
-        "được", "này", "đó", "khi", "nào", "như", "hay", "hoặc", "một",
-        "những", "để", "theo", "từ", "tới", "đến", "trên", "dưới",
-        "không", "thể", "cần", "phải", "sẽ", "đã", "đang", "rất",
-        "hãy", "nêu", "trình", "bày", "liệt", "mọi", "bởi", "vì",
-        "sau", "trước", "giữa", "tại", "qua", "còn", "lại", "nên",
-        # Tiếng Anh — stop words
-        "the", "of", "and", "for", "in", "is", "to", "a", "an",
-        "it", "on", "at", "by", "or", "be", "that", "this", "with",
-        "are", "was", "were", "has", "have", "had", "not", "but",
-        "from", "they", "their", "can", "will", "its", "which",
-    }
-    filtered = [w for w in words if len(w) >= 3 and w not in _STOP]
-
-    # Bigram — cụm 2 từ (min 7 ký tự để bỏ cặp quá ngắn)
-    for i in range(len(filtered) - 1):
-        bigram = f"{filtered[i]} {filtered[i+1]}"
-        if len(bigram) >= 7:
-            entities.add(bigram)
-
-    # Trigram — cụm 3 từ (min 10 ký tự)
-    for i in range(len(filtered) - 2):
-        trigram = f"{filtered[i]} {filtered[i+1]} {filtered[i+2]}"
-        if len(trigram) >= 10:
-            entities.add(trigram)
-
-    return list(entities)[:40]  # tăng lên 40 để graph phong phú hơn
+JSON:"""
+    try:
+        raw = llm.invoke(prompt).strip()
+        # Bỏ markdown fence nếu có
+        raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+        relations = json.loads(raw)
+        # Validate: phải là list of dict với 3 keys
+        valid = [
+            r for r in relations
+            if isinstance(r, dict)
+            and all(k in r for k in ("e1", "rel", "e2"))
+            and r["e1"].strip() and r["e2"].strip()
+        ]
+        return valid[:8]
+    except Exception:
+        # Fallback: chỉ extract acronym + Title Case làm entities đơn
+        entities = list(set(
+            re.findall(r'\b[A-Z]{2,}\b', text) +
+            re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', text)
+        ))[:6]
+        relations = []
+        for i in range(len(entities)):
+            for j in range(i + 1, len(entities)):
+                relations.append({"e1": entities[i], "rel": "related_to", "e2": entities[j]})
+        return relations[:8]
 
 
 def build_graph_rag(chunks: list) -> nx.Graph:
     """
-    Xây đồ thị từ danh sách chunks:
-    - Node: thực thể (entity) được trích xuất từ text
-    - Edge: hai entity cùng xuất hiện trong 1 chunk → có liên hệ
-    - Node attribute: list các chunk_id chứa entity đó
-    - Edge attribute: số lần đồng xuất hiện (co-occurrence weight)
+    Xây Knowledge Graph từ chunks bằng LLM-based entity extraction.
 
-    Trả về: networkx.Graph
+    Kiến trúc chuẩn Graph RAG (Microsoft 2024):
+    - Node: entity thực sự (tên công cụ, khái niệm, phương pháp)
+    - Edge: relationship có ngữ nghĩa ("sử dụng", "là thành phần của", ...)
+    - Node attribute:
+        * chunks  : list các đoạn văn chứa entity này
+        * embedding: vector của entity name (để semantic search)
+    - Edge attribute:
+        * rel     : tên quan hệ
+        * weight  : số lần quan hệ này xuất hiện
+
+    Retrieve sau này dùng embedding similarity thay vì keyword match.
     """
+    llm = _get_llm()
+    embedder = get_embedder()
     G = nx.Graph()
+
+    # Batch size nhỏ để không quá tải Qwen 3b
+    BATCH = 1
 
     for idx, chunk in enumerate(chunks):
         text = chunk.page_content
         page = chunk.metadata.get("page", "?")
         source = chunk.metadata.get("source", "unknown")
+        chunk_data = {
+            "chunk_idx": idx,
+            "page": page,
+            "source": source,
+            "content": text,
+        }
 
-        entities = _extract_entities_simple(text)
+        relations = _extract_entities_and_relations_llm(text, llm)
 
-        # Thêm node cho từng entity
-        for ent in entities:
-            if G.has_node(ent):
-                G.nodes[ent]["chunks"].append({
-                    "chunk_idx": idx,
-                    "page": page,
-                    "source": source,
-                    "content": text,
-                })
+        for rel in relations:
+            e1 = rel["e1"].strip()
+            e2 = rel["e2"].strip()
+            relationship = rel["rel"].strip()
+
+            # ── Thêm / cập nhật node e1 ──────────────────────
+            if G.has_node(e1):
+                G.nodes[e1]["chunks"].append(chunk_data)
             else:
-                G.add_node(ent, chunks=[{
-                    "chunk_idx": idx,
-                    "page": page,
-                    "source": source,
-                    "content": text,
-                }])
+                G.add_node(e1, chunks=[chunk_data], label=e1)
 
-        # Thêm edge giữa các entity trong cùng chunk
-        for i in range(len(entities)):
-            for j in range(i + 1, len(entities)):
-                e1, e2 = entities[i], entities[j]
-                if G.has_edge(e1, e2):
-                    G[e1][e2]["weight"] += 1
-                else:
-                    G.add_edge(e1, e2, weight=1)
+            # ── Thêm / cập nhật node e2 ──────────────────────
+            if G.has_node(e2):
+                G.nodes[e2]["chunks"].append(chunk_data)
+            else:
+                G.add_node(e2, chunks=[chunk_data], label=e2)
+
+            # ── Thêm / cập nhật edge ─────────────────────────
+            if G.has_edge(e1, e2):
+                G[e1][e2]["weight"] += 1
+                if relationship not in G[e1][e2]["rels"]:
+                    G[e1][e2]["rels"].append(relationship)
+            else:
+                G.add_edge(e1, e2, weight=1, rels=[relationship])
+
+    # ── Tính embedding cho từng node (batch) ─────────────────
+    node_list = list(G.nodes())
+    if node_list:
+        try:
+            node_embeddings = embedder.embed_documents(node_list)
+            for node, emb in zip(node_list, node_embeddings):
+                G.nodes[node]["embedding"] = emb
+        except Exception:
+            pass  # Nếu embedding lỗi vẫn hoạt động được (fallback keyword)
 
     return G
 
@@ -256,96 +277,122 @@ def _score_chunk(content: str, keywords: list) -> float:
 
 def _graph_retrieve(question: str, graph: nx.Graph, top_k: int = 6) -> list[dict]:
     """
-    Scored retrieval — gán điểm tổng hợp cho mỗi chunk từ 3 tín hiệu:
+    Graph RAG Retrieval — 3 tầng theo đúng chuẩn Microsoft GraphRAG:
 
-      Signal 1 — Direct node match (base_score = match_strength ∈ [0.7, 1.0]):
-        Entity/keyword từ câu hỏi khớp trực tiếp với node trong graph.
-        Exact match → 1.0, partial match → 0.7–0.9 (tỉ lệ overlap).
+    Tầng 1 — Semantic Node Matching (embedding similarity):
+        Embed câu hỏi → so sánh cosine similarity với embedding của từng node.
+        Node nào similarity cao nhất → "seed nodes".
+        Đây là điểm khác biệt cốt lõi so với keyword matching cũ.
 
-      Signal 2 — Neighbor expansion (base_score ≤ 0.5):
-        Chỉ lấy tối đa MAX_NEIGHBORS neighbor per matched node,
-        weighted theo edge_weight (co-occurrence thực sự cao mới lấy).
-        base_score = node_strength × 0.5 × (edge_w / max_edge_w).
+    Tầng 2 — Graph Traversal (neighbor expansion):
+        Từ seed nodes, duyệt sang neighbors trong graph.
+        Neighbor được chọn dựa trên edge weight (số lần đồng xuất hiện trong LLM extraction).
+        Mang lại thông tin liên quan gián tiếp mà pure vector search bỏ sót.
 
-      Signal 3 — Keyword relevance bonus (cộng vào mọi chunk, tối đa +0.5):
-        _score_chunk() đo coverage + density của keywords trong content.
+    Tầng 3 — Chunk Deduplication + Ranking:
+        Gom tất cả chunks từ seed + neighbor nodes.
+        Score = node_similarity × node_weight + neighbor_bonus.
+        Deduplicate theo chunk_idx, giữ score cao nhất.
 
-    final_score = base_score + 0.5 × keyword_score  ∈ [0, 1.5]
-
-    Chỉ giữ chunk có final_score ≥ MIN_SCORE (0.15) để lọc nhiễu.
-    Fallback: keyword-only search toàn graph nếu không có chunk nào pass.
+    Fallback: nếu không có node nào có embedding (graph cũ hoặc lỗi),
+    tự động về keyword scoring để không crash.
     """
-    MIN_SCORE    = 0.15   # ngưỡng lọc: chunk dưới mức này bị bỏ
-    MAX_NEIGHBORS = 2     # tối đa neighbor per matched node
+    MIN_SIM       = 0.25   # ngưỡng cosine similarity để chọn seed node
+    MAX_SEED      = 5      # tối đa seed nodes
+    MAX_NEIGHBORS = 3      # tối đa neighbors per seed
 
-    # ── Chuẩn bị keywords ─────────────────────────────────────
-    _STOP = {
-        "là", "của", "và", "các", "có", "cho", "trong", "với", "về",
-        "được", "này", "đó", "khi", "nào", "như", "hay", "hoặc", "một",
-        "những", "để", "theo", "hãy", "nêu", "trình", "bày", "liệt", "kê",
-        "từng", "mỗi", "tất", "cả", "luôn", "đều", "sao", "vậy", "thế",
-        "the", "of", "and", "for", "in", "is", "to", "a", "an", "what",
-        "how", "why", "when", "which", "who", "does", "do", "are", "was",
-    }
-    keywords = [
-        w for w in re.findall(r'[\w\u00C0-\u024F\u1E00-\u1EFF]+', question.lower())
-        if len(w) >= 3 and w not in _STOP
+    node_list = list(graph.nodes())
+    if not node_list:
+        return []
+
+    # ── Tầng 1: Semantic Node Matching ───────────────────────
+    # Lấy embeddings của nodes (đã tính lúc build_graph_rag)
+    nodes_with_emb = [
+        (n, graph.nodes[n]["embedding"])
+        for n in node_list
+        if "embedding" in graph.nodes[n]
     ]
 
-    # ── Signal 1: Direct node match ───────────────────────────
-    q_entities = _extract_entities_simple(question)
-    raw_words = [w for w in re.findall(r'[\w\u00C0-\u024F\u1E00-\u1EFF]+', question.lower())
-                 if len(w) >= 4]
-    q_entities = list(set(q_entities + raw_words))
+    seed_nodes: dict = {}   # node → similarity score
 
-    matched_nodes: dict = {}   # node → match_strength
-    for ent in q_entities:
-        ent_lower = ent.lower()
-        if graph.has_node(ent):
-            matched_nodes[ent] = 1.0
-        elif graph.has_node(ent_lower):
-            matched_nodes[ent_lower] = 1.0
-        else:
-            for node in graph.nodes():
-                node_lower = node.lower()
-                # Partial match: chỉ lấy nếu overlap đủ dài (≥ 4 ký tự)
-                if ent_lower in node_lower:
-                    overlap = ent_lower
-                elif node_lower in ent_lower:
-                    overlap = node_lower
-                else:
-                    continue
-                if len(overlap) >= 4:
-                    strength = len(overlap) / max(len(ent_lower), len(node_lower))
-                    if node not in matched_nodes or matched_nodes[node] < strength:
-                        matched_nodes[node] = min(strength, 0.9)
+    if nodes_with_emb:
+        # Embed câu hỏi
+        embedder = get_embedder()
+        q_emb = np.array(embedder.embed_query(question))
+        q_norm = np.linalg.norm(q_emb)
 
-    # ── Signal 2: Neighbor expansion (chọn lọc) ───────────────
-    neighbor_nodes: dict = {}  # node → neighbor_score
-    for node, node_strength in matched_nodes.items():
+        # Tính cosine similarity với tất cả nodes
+        for node, node_emb in nodes_with_emb:
+            n_emb = np.array(node_emb)
+            n_norm = np.linalg.norm(n_emb)
+            if q_norm == 0 or n_norm == 0:
+                continue
+            sim = float(np.dot(q_emb, n_emb) / (q_norm * n_norm))
+            if sim >= MIN_SIM:
+                seed_nodes[node] = sim
+
+        # Giữ top MAX_SEED seeds
+        seed_nodes = dict(
+            sorted(seed_nodes.items(), key=lambda x: x[1], reverse=True)[:MAX_SEED]
+        )
+    else:
+        # Fallback: không có embedding → dùng keyword match đơn giản
+        keywords = [
+            w.lower() for w in re.findall(r'[\w\u00C0-\u024F\u1E00-\u1EFF]+', question)
+            if len(w) >= 4
+        ]
+        for node in node_list:
+            nl = node.lower()
+            if any(kw in nl or nl in kw for kw in keywords):
+                seed_nodes[node] = 0.7
+
+    if not seed_nodes:
+        # Không tìm được seed nào → fallback lấy tất cả chunks rank bằng keyword
+        keywords = [
+            w.lower() for w in re.findall(r'[\w\u00C0-\u024F\u1E00-\u1EFF]+', question)
+            if len(w) >= 3
+        ]
+        all_chunks: dict = {}
+        for node in node_list:
+            for ci in graph.nodes[node].get("chunks", []):
+                idx = ci["chunk_idx"]
+                if idx not in all_chunks:
+                    s = _score_chunk(ci["content"], keywords)
+                    all_chunks[idx] = (s, ci)
+        ranked_fb = sorted(all_chunks.values(), key=lambda x: x[0], reverse=True)
+        return [ci for _, ci in ranked_fb[:top_k] if _ > 0]
+
+    # ── Tầng 2: Graph Traversal ────────────────────────────────
+    neighbor_nodes: dict = {}   # node → neighbor_score
+    for node, sim in seed_nodes.items():
         nbrs = list(graph.neighbors(node))
         if not nbrs:
             continue
-        max_w = max(graph[node][n].get("weight", 1) for n in nbrs)
-        nbrs.sort(key=lambda n: graph[node][n].get("weight", 0), reverse=True)
-        for nb in nbrs[:MAX_NEIGHBORS]:
-            if nb in matched_nodes:   # không ghi đè direct match
-                continue
-            edge_w  = graph[node][nb].get("weight", 1)
-            nb_score = node_strength * 0.5 * (edge_w / max_w)
+        # Sort neighbors theo edge weight (LLM-extracted relation frequency)
+        nbrs_sorted = sorted(
+            nbrs,
+            key=lambda n: graph[node][n].get("weight", 0),
+            reverse=True
+        )
+        max_w = graph[node][nbrs_sorted[0]].get("weight", 1) if nbrs_sorted else 1
+        for nb in nbrs_sorted[:MAX_NEIGHBORS]:
+            if nb in seed_nodes:
+                continue   # đã là seed, không cần ghi đè
+            edge_w = graph[node][nb].get("weight", 1)
+            # Neighbor score = seed_sim × 0.6 × (relative edge weight)
+            nb_score = sim * 0.6 * (edge_w / max_w)
             if nb not in neighbor_nodes or neighbor_nodes[nb] < nb_score:
                 neighbor_nodes[nb] = nb_score
 
-    # ── Gom chunks + tính final_score ─────────────────────────
-    chunk_scores: dict = {}   # chunk_idx → (final_score, chunk_data)
+    # ── Tầng 3: Gom chunks + Dedup + Rank ─────────────────────
+    chunk_scores: dict = {}   # chunk_idx → (score, chunk_data)
 
-    for node, strength in matched_nodes.items():
+    for node, sim in seed_nodes.items():
         if not graph.has_node(node):
             continue
         for ci in graph.nodes[node].get("chunks", []):
             idx = ci["chunk_idx"]
-            kw  = _score_chunk(ci["content"], keywords)
-            final = strength + 0.5 * kw
+            final = sim   # score = cosine similarity của seed node
             if idx not in chunk_scores or chunk_scores[idx][0] < final:
                 chunk_scores[idx] = (final, ci)
 
@@ -354,34 +401,11 @@ def _graph_retrieve(question: str, graph: nx.Graph, top_k: int = 6) -> list[dict
             continue
         for ci in graph.nodes[node].get("chunks", []):
             idx = ci["chunk_idx"]
-            kw  = _score_chunk(ci["content"], keywords)
-            final = nb_score + 0.5 * kw
-            if idx not in chunk_scores or chunk_scores[idx][0] < final:
-                chunk_scores[idx] = (final, ci)
+            if idx not in chunk_scores or chunk_scores[idx][0] < nb_score:
+                chunk_scores[idx] = (nb_score, ci)
 
-    # ── Lọc MIN_SCORE + sort giảm dần ─────────────────────────
-    ranked = sorted(
-        [(s, ci) for s, ci in chunk_scores.values() if s >= MIN_SCORE],
-        key=lambda x: x[0],
-        reverse=True,
-    )
-    if ranked:
-        return [ci for _, ci in ranked[:top_k]]
-
-    # ── Fallback: keyword-only search toàn graph ──────────────
-    fallback: list = []
-    seen_fb: set = set()
-    for node in graph.nodes():
-        for ci in graph.nodes[node].get("chunks", []):
-            idx = ci["chunk_idx"]
-            if idx in seen_fb:
-                continue
-            seen_fb.add(idx)
-            s = _score_chunk(ci["content"], keywords)
-            if s > 0:
-                fallback.append((s, ci))
-    fallback.sort(key=lambda x: x[0], reverse=True)
-    return [ci for _, ci in fallback[:top_k]]
+    ranked = sorted(chunk_scores.values(), key=lambda x: x[0], reverse=True)
+    return [ci for _, ci in ranked[:top_k]]
 
 
 # ══════════════════════════════════════════════════════════════
@@ -676,29 +700,25 @@ def ask_compare_rag(
     graph: nx.Graph,
     chat_history: list = None,
 ) -> Generator[str, None, None]:
-    """
-    Generator yield các token theo protocol:
-      @@CLASSIC_START@@         — bắt đầu classic rag answer
-      <token>...                — từng token của classic answer (streaming)
-      @@CLASSIC_SOURCES@@ JSON  — sources của classic
-      @@GRAPH_START@@           — bắt đầu graph rag answer
-      <token>...                — từng token của graph answer (streaming)
-      @@GRAPH_SOURCES@@ JSON    — sources của graph
-      @@COMPARE_DONE@@          — kết thúc
-    """
     lang = _detect_language(question)
     history_text = _format_chat_history(chat_history or [])
     llm = _get_llm()
 
-    # ── Phần 1: Classic RAG (stream từng token) ───────────────
+    # ── Phần 1: Classic RAG 
     yield "@@CLASSIC_START@@"
 
-    classic_prompt = _build_prompt(lang)
-    source_docs = retriever.invoke(question)[:CONFIG["retriever_k"]]
+    classic_docs = retriever.invoke(question)[:20]
+    selected_file = CONFIG.get("selected_file", "All")
+    if selected_file != "All":
+        classic_docs = [d for d in classic_docs if d.metadata.get("source") == selected_file]
+
     if CONFIG.get("use_rerank", False):
-        source_docs = rerank_documents(question, source_docs, top_k=CONFIG["retriever_k"])
+        source_docs = rerank_documents(question, classic_docs, top_k=CONFIG["retriever_k"])
+    else:
+        source_docs = classic_docs[:CONFIG["retriever_k"]]
 
     context_classic = "\n\n".join(d.page_content for d in source_docs)
+    classic_prompt = _build_prompt(lang)
     filled_classic = classic_prompt.format(
         context=context_classic, question=question, chat_history=history_text
     )
@@ -718,10 +738,10 @@ def ask_compare_rag(
     ]
     yield "@@CLASSIC_SOURCES@@" + json.dumps(classic_sources, ensure_ascii=False)
 
-    # ── Phần 2: Graph RAG (stream từng token + prompt riêng) ──
+    # ── Phần 2: Graph RAG 
     yield "@@GRAPH_START@@"
 
-    graph_top_k = max(CONFIG["retriever_k"], 6)  # Graph RAG cần nhiều chunks hơn
+    graph_top_k = 10          
     graph_chunks = _graph_retrieve(question, graph, top_k=graph_top_k)
 
     if graph_chunks:
@@ -753,7 +773,6 @@ def ask_compare_rag(
     ]
     yield "@@GRAPH_SOURCES@@" + json.dumps(graph_sources, ensure_ascii=False)
     yield "@@COMPARE_DONE@@"
-
 
 # ══════════════════════════════════════════════════════════════
 # 8. SELF-RAG
