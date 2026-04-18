@@ -1,17 +1,3 @@
-# ══════════════════════════════════════════════════════════════
-# app.py  —  File điều phối chính (entry point)  [v1.3 - optimized]
-#
-# Các tối ưu hiệu năng so với v1.2:
-#   1. Ollama health-check chỉ chạy 1 lần lúc khởi động, không
-#      chạy lại mỗi lần Streamlit rerun → loại bỏ 3s timeout lag
-#   2. load_all_sessions() được cache vào session_state, chỉ
-#      reload khi thực sự có thay đổi (xóa / thêm session mới)
-#   3. LLM streaming: câu trả lời hiện ra từng chữ ngay lập tức
-#      thay vì chờ model sinh xong toàn bộ rồi mới hiện
-#   4. st.rerun() được thay bằng cập nhật session_state trực tiếp
-#      ở những chỗ không cần full rerun (xóa chat, xóa PDF)
-# ══════════════════════════════════════════════════════════════
-
 import os
 import tempfile
 import urllib.request
@@ -21,26 +7,22 @@ import json
 import streamlit as st
 
 from database import (
-    init_db,
-    save_message,
-    load_history,
-    load_all_sessions,
-    delete_session,
-    clear_all_history,
+    init_db, save_message, load_history,
+    load_all_sessions, delete_session, clear_all_history,
 )
-from rag_engine import get_embedder, process_pdf, process_docx, ask_question_stream_with_sources
+from rag_engine import (
+    get_embedder, process_pdf, process_docx,
+    ask_question_stream_with_sources,
+    ask_compare_rag, build_graph_rag,
+)
 from styles import APP_CSS
 
 # ══════════════════════════════════════════════════════════════
-# KHỞI TẠO (chỉ chạy 1 lần khi server start)
+# KHỞI TẠO
 # ══════════════════════════════════════════════════════════════
 
 init_db()
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-
-# ══════════════════════════════════════════════════════════════
-# PAGE CONFIG + CSS
-# ══════════════════════════════════════════════════════════════
 
 st.set_page_config(
     page_title="SmartDoc AI",
@@ -51,50 +33,53 @@ st.set_page_config(
 st.markdown(APP_CSS, unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════
-# SESSION STATE — khởi tạo tất cả keys ở 1 chỗ
+# SESSION STATE
 # ══════════════════════════════════════════════════════════════
 
 _defaults = {
     "retriever": None,
+    "graph": None,            # Graph RAG graph object
+    "chunks_store": None,     # lưu chunks để build graph khi cần
     "chat_history": [],
     "pdf_info": None,
     "view_session": None,
-    "ollama_ok": None,  # None = chưa check, True/False = kết quả
-    "sessions_cache": None,  # cache load_all_sessions()
-    "sessions_dirty": True,  # True = cần reload từ DB
+    "ollama_ok": None,
+    "sessions_cache": None,
+    "sessions_dirty": True,
     "uploader_key": 0,
+    "chunk_size": 1000,
+    "chunk_overlap": 100,
+    "top_k": 5,
+    "documents": [],
+    "selected_file": "All",
+    "use_rerank": False,
+    "rag_mode": "Basic RAG",
+    "compare_mode": False,    # True = chế độ so sánh Classic vs Graph
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# Tạo session_id ổn định (chỉ tạo 1 lần)
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())[:8]
 
-# Khôi phục lịch sử từ SQLite khi reload trang (chỉ khi list đang rỗng)
 if not st.session_state.chat_history:
     rows = load_history(st.session_state.session_id)
     st.session_state.chat_history = [
-        {"question": q, "answer": a, "sources": s, "timestamp": t} for q, a, s, t in rows
+        {"question": q, "answer": a, "sources": s, "timestamp": t}
+        for q, a, s, t in rows
     ]
 
-
 # ══════════════════════════════════════════════════════════════
-# CACHE FUNCTIONS
+# CACHE / HELPERS
 # ══════════════════════════════════════════════════════════════
 
 @st.cache_resource(show_spinner="Đang tải embedding model...")
 def _cached_embedder():
-    """Embedding model — tải 1 lần duy nhất suốt vòng đời server."""
     return get_embedder()
 
 
 def _get_ollama_status() -> bool:
-    """
-    Kiểm tra Ollama chỉ 1 lần rồi cache vào session_state.
-    Không gọi network mỗi lần Streamlit rerun nữa.
-    """
     if st.session_state.ollama_ok is None:
         try:
             urllib.request.urlopen(OLLAMA_HOST, timeout=2)
@@ -105,10 +90,6 @@ def _get_ollama_status() -> bool:
 
 
 def _get_sessions():
-    """
-    Cache danh sách sessions vào session_state.
-    Chỉ query SQLite khi sessions_dirty = True (sau khi xóa / thêm mới).
-    """
     if st.session_state.sessions_dirty or st.session_state.sessions_cache is None:
         st.session_state.sessions_cache = load_all_sessions()
         st.session_state.sessions_dirty = False
@@ -116,46 +97,25 @@ def _get_sessions():
 
 
 def _mark_sessions_dirty():
-    """Gọi hàm này sau mọi thao tác thay đổi DB để invalidate cache."""
     st.session_state.sessions_dirty = True
 
 
 # ══════════════════════════════════════════════════════════════
-# CONFIRM DIALOGS
+# DIALOGS
 # ══════════════════════════════════════════════════════════════
-
-@st.dialog("Bắt đầu đoạn chat mới?")
-def _dialog_new_chat():
-    st.caption("Chat hiện tại và tài liệu đang tải sẽ bị xóa. Lịch sử hội thoại vẫn được lưu lại.")
-    col1, col2 = st.columns(2, gap="small")
-    with col1:
-        if st.button("Đồng ý", type="primary", use_container_width=True):
-            # Tạo session_id mới → đoạn chat hoàn toàn mới
-            st.session_state.session_id = str(uuid.uuid4())[:8]
-            st.session_state.chat_history = []
-            st.session_state.retriever = None
-            st.session_state.pdf_info = None
-            st.session_state.view_session = None
-            st.session_state.uploader_key += 1
-            _mark_sessions_dirty()
-            st.rerun()
-    with col2:
-        if st.button("Hủy", type="secondary", use_container_width=True):
-            st.rerun()
-
 
 @st.dialog("Xóa tất cả lịch sử?")
 def _dialog_clear_all_history():
-    st.warning("**Toàn bộ** lịch sử của mọi phiên sẽ bị xóa vĩnh viễn. Không thể hoàn tác.")
-    col1, col2 = st.columns(2, gap="small")
-    with col1:
+    st.warning("**Toàn bộ** lịch sử của mọi phiên sẽ bị xóa vĩnh viễn.")
+    c1, c2 = st.columns(2)
+    with c1:
         if st.button("Xác nhận", type="primary", use_container_width=True):
             clear_all_history()
             st.session_state.chat_history = []
             st.session_state.view_session = None
             _mark_sessions_dirty()
             st.rerun()
-    with col2:
+    with c2:
         if st.button("Hủy", use_container_width=True):
             st.rerun()
 
@@ -163,26 +123,28 @@ def _dialog_clear_all_history():
 @st.dialog("Xóa tài liệu đang tải?")
 def _dialog_delete_pdf():
     info = st.session_state.pdf_info
-    name = info["name"] if info else "tài liệu hiện tại"
-    st.warning(f"Tài liệu **{name}** sẽ bị gỡ khỏi hệ thống. Lịch sử chat vẫn được giữ lại.")
-    col1, col2 = st.columns(2, gap="small")
-    with col1:
+    name = info.get("names", ["tài liệu hiện tại"])[0] if info else "tài liệu hiện tại"
+    st.warning(f"Tài liệu **{name}** sẽ bị gỡ khỏi hệ thống.")
+    c1, c2 = st.columns(2)
+    with c1:
         if st.button("Xác nhận", type="primary", use_container_width=True):
             st.session_state.uploader_key += 1
             st.session_state.retriever = None
+            st.session_state.graph = None
+            st.session_state.chunks_store = None
             st.session_state.pdf_info = None
+            st.session_state.documents = []
             st.rerun()
-    with col2:
+    with c2:
         if st.button("Hủy", use_container_width=True):
             st.rerun()
 
 
+# ══════════════════════════════════════════════════════════════
+# RENDER HELPERS
+# ══════════════════════════════════════════════════════════════
+
 def _highlight_text(content: str, question: str) -> str:
-    """
-    Highlight các từ khóa từ câu hỏi trong đoạn văn nguồn.
-    - Bỏ qua stop words tiếng Việt và tiếng Anh
-    - Dùng regex case-insensitive để tìm và bôi vàng
-    """
     import re
     STOP_WORDS = {
         "là", "của", "và", "các", "có", "cho", "trong", "với", "về", "được",
@@ -194,19 +156,18 @@ def _highlight_text(content: str, question: str) -> str:
     keywords = [t for t in raw_tokens if len(t) > 2 and t.lower() not in STOP_WORDS]
     if not keywords:
         return content
-    safe_content = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    safe = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     for kw in keywords:
         pattern = re.compile(re.escape(kw), re.IGNORECASE | re.UNICODE)
-        safe_content = pattern.sub(
+        safe = pattern.sub(
             lambda m: f"<mark style='background:#FFD700;padding:1px 3px;"
                       f"border-radius:3px;font-weight:600'>{m.group()}</mark>",
-            safe_content,
+            safe,
         )
-    return safe_content
+    return safe
 
 
-def _render_sources(sources_data: list, question: str = ""):
-    """Render expander nguồn tham khảo — dùng chung cho chat mới và load history."""
+def _render_sources(sources_data: list, question: str = "", key_prefix: str = ""):
     if not sources_data:
         return
     with st.expander(f"📚 Nguồn tham khảo ({len(sources_data)} đoạn)"):
@@ -233,71 +194,74 @@ def _render_sources(sources_data: list, question: str = ""):
 
 with st.sidebar:
     st.markdown("## SMARTDOC AI")
-    st.caption("RAG · Qwen2.5 · FAISS")
+    st.caption("RAG · Qwen2.5 · FAISS · Graph")
     st.divider()
 
     st.markdown("### Hướng dẫn")
     st.markdown("""
-        1. Upload file PDF  
-        2. Chờ hệ thống xử lý  
-        3. Nhập câu hỏi  
-        4. Nhận câu trả lời  
-            """)
+1. Upload file PDF/DOCX  
+2. Chờ hệ thống xử lý  
+3. Nhập câu hỏi  
+4. Nhận câu trả lời  
+    """)
     st.divider()
 
-    if "chunk_size" not in st.session_state:
-        st.session_state.chunk_size = 1000
-
-    if "chunk_overlap" not in st.session_state:
-        st.session_state.chunk_overlap = 100
-
-    # UI chọn
     st.markdown("### Cài đặt")
 
-    use_rerank = st.checkbox(
-        "Bật Re-ranking (Cross-Encoder)",
-        value=st.session_state.get("use_rerank", False)
+    # ── Chế độ RAG ──────────────────────────────────────────
+    compare_mode = st.toggle(
+        "So sánh RAG vs Graph RAG",
+        value=st.session_state.compare_mode,
+        help="Bật để xem câu trả lời song song từ 2 phương pháp RAG khác nhau. Chỉ hỗ trợ 1 file."
     )
-    st.session_state.use_rerank = use_rerank
+    st.session_state.compare_mode = compare_mode
+
+    if not compare_mode:
+        use_rerank = st.checkbox(
+            "Bật Re-ranking (Cross-Encoder)",
+            value=st.session_state.use_rerank
+        )
+        st.session_state.use_rerank = use_rerank
+
+        rag_mode = st.radio(
+            "Chọn RAG:",
+            ["Basic RAG", "Self-RAG"],
+            index=0 if st.session_state.rag_mode == "Basic RAG" else 1,
+            horizontal=True,
+        )
+        st.session_state.rag_mode = rag_mode
+    else:
+        st.info("Chế độ so sánh: Classic RAG ↔ Graph RAG.")
+        st.session_state.rag_mode = "Basic RAG"
+
+    # Sync CONFIG
     from rag_engine import CONFIG
     CONFIG["use_rerank"] = st.session_state.use_rerank
-
-    rag_mode = st.radio(
-        "Chọn RAG:",
-        ["Basic RAG", "Self-RAG"],
-        index=0 if st.session_state.get("rag_mode", "basic") == "basic" else 1,
-        horizontal = True
-    )
-    st.session_state.rag_mode = rag_mode
-    from rag_engine import CONFIG
     CONFIG["use_self_rag"] = (st.session_state.rag_mode == "Self-RAG")
 
+    # ── Filter tài liệu (chỉ hiện khi không compare) ────────
     selected_file = "All"
-    if st.session_state.pdf_info:
+    if st.session_state.pdf_info and not compare_mode:
         selected_file = st.selectbox(
             "Filter theo tài liệu",
             ["All"] + st.session_state.pdf_info["names"]
         )
     st.session_state.selected_file = selected_file
-    from rag_engine import CONFIG
     CONFIG["selected_file"] = selected_file
 
+    # ── Chunk / Top K ────────────────────────────────────────
     chunk_size = st.selectbox(
-        "Chọn Chunk Size",
+        "Chunk Size",
         [500, 1000, 1500, 2000],
         index=[500, 1000, 1500, 2000].index(st.session_state.chunk_size)
     )
-
     chunk_overlap = st.selectbox(
-        "Chọn Chunk Overlap",
+        "Chunk Overlap",
         [50, 100, 200, 300],
         index=[50, 100, 200, 300].index(st.session_state.chunk_overlap)
     )
-    if "top_k" not in st.session_state:
-        st.session_state.top_k = 5
-
     top_k = st.selectbox(
-        "Chọn Top K (số đoạn retrieve)",
+        "Top K",
         [3, 5, 7, 10],
         index=[3, 5, 7, 10].index(st.session_state.top_k)
     )
@@ -305,30 +269,26 @@ with st.sidebar:
     st.session_state.chunk_size = chunk_size
     st.session_state.chunk_overlap = chunk_overlap
     st.session_state.top_k = top_k
+    CONFIG["retriever_k"] = top_k
 
-    # Cập nhật CONFIG ngay khi user thay đổi
-    from rag_engine import CONFIG
-    CONFIG["retriever_k"] = st.session_state.top_k
-
-    # Nếu đang có tài liệu và user thay đổi chunk params → yêu cầu re-process
     if st.session_state.pdf_info:
         prev_cs = st.session_state.pdf_info.get("chunk_size")
         prev_co = st.session_state.pdf_info.get("chunk_overlap")
         if prev_cs is not None and (prev_cs != chunk_size or prev_co != chunk_overlap):
-            st.warning("⚠️ Chunk params đã thay đổi. Hãy upload lại tài liệu để áp dụng.")
+            st.warning("⚠️ Chunk params đã thay đổi. Upload lại tài liệu để áp dụng.")
 
     st.markdown(f"""
-        <div class="setting-item"><span>Filter</span><code>{st.session_state.selected_file}</code></div>
-        <div class="setting-item"><span>Chunk Size</span><code>{st.session_state.chunk_size}</code></div>
-        <div class="setting-item"><span>Chunk Overlap</span><code>{st.session_state.chunk_overlap}</code></div>
-        <div class="setting-item"><span>Top K</span><code>{st.session_state.top_k}</code></div>
+        <div class="setting-item"><span>Filter</span><code>{selected_file}</code></div>
+        <div class="setting-item"><span>Chunk Size</span><code>{chunk_size}</code></div>
+        <div class="setting-item"><span>Chunk Overlap</span><code>{chunk_overlap}</code></div>
+        <div class="setting-item"><span>Top K</span><code>{top_k}</code></div>
     """, unsafe_allow_html=True)
 
     st.divider()
 
     st.markdown("### Model")
     st.markdown(f"""
-        <div class="setting-item"><span>LLM</span><code>qwen2.5:5b</code></div>
+        <div class="setting-item"><span>LLM</span><code>{CONFIG['llm_model']}</code></div>
         <div class="setting-item"><span>Embedding</span><code>mpnet-base-v2</code></div>
         <div class="setting-item"><span>Vector DB</span><code>FAISS</code></div>
         <div class="setting-item"><span>Framework</span><code>LangChain</code></div>
@@ -336,7 +296,6 @@ with st.sidebar:
 
     st.divider()
 
-    # dùng cached status, không gọi network mỗi rerun
     if _get_ollama_status():
         st.success("🟢 Ollama đang chạy")
     else:
@@ -345,48 +304,48 @@ with st.sidebar:
         if st.button("🔄 Kiểm tra lại"):
             st.session_state.ollama_ok = None
             st.rerun()
+
     st.divider()
 
-    # Nút chat mới và xóa file
     col1, col2 = st.columns(2)
     with col1:
         if st.button("New chat", use_container_width=True):
-            # Tạo session_id mới → đoạn chat hoàn toàn mới
             st.session_state.session_id = str(uuid.uuid4())[:8]
             st.session_state.chat_history = []
             st.session_state.retriever = None
+            st.session_state.graph = None
+            st.session_state.chunks_store = None
             st.session_state.pdf_info = None
             st.session_state.view_session = None
             st.session_state.uploader_key += 1
+            st.session_state.documents = []
             _mark_sessions_dirty()
             st.rerun()
     with col2:
-        pdf_btn_disabled = st.session_state.pdf_info is None
-        if st.button("🗑 Xóa tài liệu", use_container_width=True, disabled=pdf_btn_disabled):
+        if st.button("🗑 Xóa tài liệu", use_container_width=True,
+                     disabled=st.session_state.pdf_info is None):
             _dialog_delete_pdf()
+
     st.divider()
 
-    # lich su hoi thoai
     st.markdown("### Lịch sử hội thoại")
     all_sessions = _get_sessions()
-
     if not all_sessions:
         st.caption("Chưa có lịch sử nào.")
     else:
         if st.button("Xóa tất cả lịch sử", use_container_width=True):
             _dialog_clear_all_history()
-
         st.markdown("")
         for sid, pdf_name, cnt, started in all_sessions:
             is_current = (sid == st.session_state.session_id)
-            badge = "" if is_current else ""
+            badge = " ●" if is_current else ""
             label = f"📄 {pdf_name or 'Unknown'}{badge}"
             sub = f"{cnt} câu · {started[:10]}"
             if st.button(f"{label} | {sub}", key=f"sess_{sid}", use_container_width=True):
                 st.session_state.view_session = sid
                 st.rerun()
 
-    st.caption("v1.3 · Spring 2026")
+    st.caption("Spring 2026")
 
 # ══════════════════════════════════════════════════════════════
 # MAIN AREA
@@ -402,15 +361,26 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Upload file ───────────────────────────────────────────────
-# Theo dõi tên file đang được xử lý để phát hiện khi user bấm × hoặc đổi file
+_accept_multiple = not st.session_state.compare_mode
 
 uploaded_files = st.file_uploader(
-    "Kéo thả hoặc click để tải lên file (PDF hoặc DOCX - tối đa 20MB)",
+    "Kéo thả hoặc click để tải lên file (PDF hoặc DOCX - tối đa 20MB)"
+    + (" · Chế độ so sánh: chỉ 1 file" if st.session_state.compare_mode else ""),
     type=["pdf", "docx"],
-    help="Chỉ hỗ trợ file PDF và .docx",
     key=f"uploader_{st.session_state.uploader_key}",
-    accept_multiple_files=True,
+    accept_multiple_files=_accept_multiple,
 )
+
+# Chuẩn hóa thành list
+if uploaded_files is None:
+    uploaded_files = []
+elif not isinstance(uploaded_files, list):
+    uploaded_files = [uploaded_files]
+
+# Giới hạn 1 file khi compare mode
+if st.session_state.compare_mode and len(uploaded_files) > 1:
+    st.warning("Chế độ so sánh chỉ hỗ trợ 1 file. Chỉ file đầu tiên sẽ được xử lý.")
+    uploaded_files = [uploaded_files[0]]
 
 if uploaded_files:
     for file in uploaded_files:
@@ -418,62 +388,48 @@ if uploaded_files:
             st.error("File quá lớn! Vui lòng chọn file dưới 20MB.")
             st.stop()
 
-# Trường hợp 1: User bấm × xóa file khỏi uploader
-# → uploaded_file = None nhưng retriever vẫn còn → reset retriever về None
 if not uploaded_files and st.session_state.retriever is not None:
     st.session_state.retriever = None
+    st.session_state.graph = None
+    st.session_state.chunks_store = None
     st.session_state.documents = []
-    # KHÔNG xóa chat_history — lịch sử chat giữ nguyên
 
-# Trường hợp 2: Có file mới (hoặc file khác tên file cũ) → xử lý chunk
 current_files = st.session_state.pdf_info.get("names", []) if st.session_state.pdf_info else []
-
 new_files = [f.name for f in uploaded_files] if uploaded_files else []
-
-need_process = (
-    uploaded_files
-    and (st.session_state.retriever is None or set(new_files) != set(current_files))
+need_process = uploaded_files and (
+    st.session_state.retriever is None or set(new_files) != set(current_files)
 )
-#with st.spinner(f"Đang xử lý tài liệu {ext.upper()}... vui lòng chờ"):
+
 if need_process:
-
     file_names = ", ".join([f.name for f in uploaded_files])
-
     with st.spinner(f"Đang xử lý {len(uploaded_files)} file: {file_names} ..."):
-
         all_chunks = []
         file_metadata = []
         embedder = _cached_embedder()
 
         for file in uploaded_files:
             ext = file.name.lower().split(".")[-1]
-
             with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
                 tmp.write(file.read())
                 tmp_path = tmp.name
 
             try:
                 with st.spinner(f"→ Đang xử lý {file.name}..."):
-
                     if ext == "pdf":
                         chunks, pages, num_chunks = process_pdf(
                             tmp_path, embedder,
                             chunk_size=st.session_state.chunk_size,
                             chunk_overlap=st.session_state.chunk_overlap,
                         )
-
-
                     elif ext == "docx":
                         chunks, pages, num_chunks = process_docx(
                             tmp_path, embedder,
                             chunk_size=st.session_state.chunk_size,
                             chunk_overlap=st.session_state.chunk_overlap,
                         )
-
                     else:
                         continue
 
-                    # ✅ GẮN METADATA
                     for chunk in chunks:
                         chunk.metadata["source"] = file.name
                         chunk.metadata["file_type"] = ext
@@ -481,54 +437,76 @@ if need_process:
 
                     all_chunks.extend(chunks)
                     del chunks
-                    file_metadata.append({
-                        "name": file.name,
-                        "pages": pages,
-                        "chunks": num_chunks
-                    })
-
+                    file_metadata.append({"name": file.name, "pages": pages, "chunks": num_chunks})
             finally:
                 os.unlink(tmp_path)
 
         from rag_engine import build_hybrid_retriever
-
         retriever = build_hybrid_retriever(all_chunks, embedder)
         st.session_state.retriever = retriever
+        st.session_state.chunks_store = all_chunks  # lưu lại để build graph
+
+        # Build Graph RAG nếu đang ở compare mode
+        if st.session_state.compare_mode:
+            with st.spinner("Đang xây dựng Knowledge Graph..."):
+                st.session_state.graph = build_graph_rag(all_chunks)
+                node_count = st.session_state.graph.number_of_nodes()
+                edge_count = st.session_state.graph.number_of_edges()
+                st.success(f"Knowledge Graph: {node_count} nodes · {edge_count} edges")
 
         del all_chunks
 
-        # ✅ LƯU METADATA
         st.session_state.pdf_info = {
             "names": [f["name"] for f in file_metadata],
-            "files": file_metadata
+            "files": file_metadata,
+            "chunk_size": st.session_state.chunk_size,
+            "chunk_overlap": st.session_state.chunk_overlap,
         }
-
-        # 👉 thêm để fix lỗi UI
         st.session_state.documents = file_metadata
-
         _mark_sessions_dirty()
 
-if st.session_state.pdf_info:
-    if st.session_state.documents:
-        st.markdown("### 📂 Tài liệu đã tải")
+# Khi bật compare mode sau khi đã upload file → build graph nếu chưa có
+if (st.session_state.compare_mode
+        and st.session_state.retriever is not None
+        and st.session_state.graph is None
+        and st.session_state.chunks_store is not None):
+    with st.spinner("Đang xây dựng Knowledge Graph từ tài liệu hiện tại..."):
+        st.session_state.graph = build_graph_rag(st.session_state.chunks_store)
+        node_count = st.session_state.graph.number_of_nodes()
+        edge_count = st.session_state.graph.number_of_edges()
+        st.success(f"Knowledge Graph: {node_count} nodes · {edge_count} edges")
 
-        for doc in st.session_state.documents:
-            file_icon = "📄" if doc["name"].lower().endswith(".pdf") else "📝"
+# Hiển thị thông tin tài liệu
+if st.session_state.pdf_info and st.session_state.documents:
+    st.markdown("### 📂 Tài liệu đã tải")
+    for doc in st.session_state.documents:
+        file_icon = "📄" if doc["name"].lower().endswith(".pdf") else "📝"
+        st.markdown(f"""
+        <div class="status-row">
+            <span class="status-chip">{file_icon} {doc['name']}</span>
+            <span class="status-chip">📑 {doc['pages']} trang</span>
+            <span class="status-chip">🧩 {doc['chunks']} chunks</span>
+        </div>
+        """, unsafe_allow_html=True)
 
-            st.markdown(f"""
-            <div class="status-row">
-                <span class="status-chip">{file_icon} {doc['name']}</span>
-                <span class="status-chip">📑 {doc['pages']} trang</span>
-                <span class="status-chip">🧩 {doc['chunks']} chunks</span>
-            </div>
-            """, unsafe_allow_html=True)
+    # Hiển thị Graph info nếu đang compare mode
+    if st.session_state.compare_mode and st.session_state.graph is not None:
+        G = st.session_state.graph
+        st.markdown(f"""
+        <div class="status-row">
+            <span class="status-chip ready">🕸️ Graph RAG sẵn sàng</span>
+            <span class="status-chip">{G.number_of_nodes()} nodes</span>
+            <span class="status-chip">{G.number_of_edges()} edges</span>
+        </div>
+        """, unsafe_allow_html=True)
 
 st.divider()
 
-# ── Chat area ─────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# CHAT AREA
+# ══════════════════════════════════════════════════════════════
 
 if st.session_state.view_session and st.session_state.view_session != st.session_state.session_id:
-    # Đang xem lịch sử session khác
     vs = st.session_state.view_session
     hist = load_history(vs)
     if hist:
@@ -549,7 +527,7 @@ if st.session_state.view_session and st.session_state.view_session != st.session
         st.session_state.view_session = None
 
 else:
-    # Session hiện tại — luôn hiển thị lịch sử chat dù có file hay không
+    # Hiển thị lịch sử chat hiện tại
     for item in st.session_state.chat_history:
         ts = item.get("timestamp", "")
         if ts:
@@ -557,11 +535,31 @@ else:
         with st.chat_message("user"):
             st.write(item["question"])
         with st.chat_message("assistant"):
-            st.write(item["answer"])
-            sources = json.loads(item["sources"]) if item.get("sources") else []
-            _render_sources(sources, question=item["question"])
+            # Kiểm tra xem có phải compare result không
+            if item.get("is_compare"):
+                col_l, col_r = st.columns(2)
+                with col_l:
+                    st.markdown("#### RAG")
+                    st.markdown(item.get("classic_answer", ""))
+                    _render_sources(
+                        json.loads(item.get("classic_sources", "[]")),
+                        question=item["question"],
+                        key_prefix=f"hist_classic_{item.get('timestamp','')}",
+                    )
+                with col_r:
+                    st.markdown("#### Graph RAG")
+                    st.markdown(item.get("graph_answer", ""))
+                    _render_sources(
+                        json.loads(item.get("graph_sources", "[]")),
+                        question=item["question"],
+                        key_prefix=f"hist_graph_{item.get('timestamp','')}",
+                    )
+            else:
+                st.write(item["answer"])
+                sources = json.loads(item["sources"]) if item.get("sources") else []
+                _render_sources(sources, question=item["question"])
 
-    # Chat input chỉ hiện khi có tài liệu đang được load
+    # Chat input
     if st.session_state.retriever is None:
         st.info("Upload file PDF hoặc DOCX để bắt đầu hỏi đáp.")
     else:
@@ -570,45 +568,150 @@ else:
         if user_question:
             with st.chat_message("user"):
                 st.write(user_question)
-            full_answer = ""
-            sources_data = []
-            with st.chat_message("assistant"):
-                answer_placeholder = st.empty()
-                answer_placeholder.markdown("Đang tìm câu trả lời...")
-                # full_answer = ""
-                try:
-                    for chunk in ask_question_stream_with_sources(
+
+            # ══════════════════════════════════════════════════
+            # COMPARE MODE: Classic RAG vs Graph RAG song song
+            # ══════════════════════════════════════════════════
+            if st.session_state.compare_mode:
+                if st.session_state.graph is None:
+                    st.warning("Graph chưa được xây dựng. Vui lòng upload lại file.")
+                else:
+                    col_l, col_r = st.columns(2)
+
+                    with col_l:
+                        st.markdown("#### RAG")
+                        classic_placeholder = st.empty()
+                        classic_placeholder.markdown(" Đang tìm câu trả lời...")
+                        classic_sources_placeholder = st.empty()
+
+                    with col_r:
+                        st.markdown("#### Graph RAG")
+                        graph_placeholder = st.empty()
+                        graph_placeholder.markdown(" Đang xử lý sau RAG...")
+                        graph_sources_placeholder = st.empty()
+
+                    classic_answer = ""
+                    classic_sources = []
+                    graph_answer = ""
+                    graph_sources = []
+                    phase = "classic"  # classic | graph
+
+                    try:
+                        for token in ask_compare_rag(
                             user_question,
                             st.session_state.retriever,
-                            chat_history=st.session_state.chat_history
-                    ):
-                        if chunk.startswith("@@CONFIDENCE@@"):
-                            score = float(chunk.replace("@@CONFIDENCE@@", ""))
-                            st.caption(f" Confidence: {score:.2f}")
-                            continue
-                        if chunk.startswith("@@SOURCES@@"):
-                            sources_data = json.loads(chunk[len("@@SOURCES@@"):])
-                            continue  # ko render ra giao dien
-                        full_answer += chunk
-                        answer_placeholder.markdown(full_answer + "▌")
+                            st.session_state.graph,
+                            chat_history=st.session_state.chat_history,
+                        ):
+                            if token == "@@CLASSIC_START@@":
+                                phase = "classic"
+                                classic_placeholder.markdown(" Đang tìm câu trả lời...")
+                                continue
 
-                    answer_placeholder.markdown(full_answer)
+                            if token.startswith("@@CLASSIC_SOURCES@@"):
+                                classic_sources = json.loads(token[len("@@CLASSIC_SOURCES@@"):])
+                                classic_placeholder.markdown(classic_answer)
+                                # Render sources trong col_l
+                                with col_l:
+                                    _render_sources(classic_sources, question=user_question,
+                                                    key_prefix="compare_classic")
+                                continue
 
-                    _render_sources(sources_data, question=user_question)
+                            if token == "@@GRAPH_START@@":
+                                phase = "graph"
+                                graph_placeholder.markdown(" Đang tìm câu trả lời...")
+                                continue
 
-                    pdf_name = ", ".join(st.session_state.pdf_info["names"]) if st.session_state.pdf_info else None
-                    save_message(st.session_state.session_id, pdf_name, user_question, full_answer,
-                                 sources=sources_data)
-                    ts_now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    st.session_state.chat_history.append({
-                        "question": user_question,
-                        "answer": full_answer,
-                        "sources": json.dumps(sources_data, ensure_ascii=False) if sources_data else None,
-                        "timestamp": ts_now,
-                    })
-                    _mark_sessions_dirty()
-                    st.rerun()
+                            if token.startswith("@@GRAPH_SOURCES@@"):
+                                graph_sources = json.loads(token[len("@@GRAPH_SOURCES@@"):])
+                                graph_placeholder.markdown(graph_answer)
+                                with col_r:
+                                    _render_sources(graph_sources, question=user_question,
+                                                    key_prefix="compare_graph")
+                                continue
 
-                except Exception as e:
-                    answer_placeholder.error(f"Lỗi khi gọi model: {e}")
-                    st.caption("Kiểm tra Ollama đang chạy và model đã được pull chưa.")
+                            if token == "@@COMPARE_DONE@@":
+                                break
+
+                            # Token bình thường
+                            if phase == "classic":
+                                classic_answer += token
+                                classic_placeholder.markdown(classic_answer + "▌")
+                            elif phase == "graph":
+                                graph_answer += token
+                                graph_placeholder.markdown(graph_answer + "▌")  # FIX: streaming Graph RAG
+
+                        # Lưu vào DB và session
+                        combined_answer = (
+                            f"**Classic RAG:**\n{classic_answer}\n\n"
+                            f"**Graph RAG:**\n{graph_answer}"
+                        )
+                        pdf_name = ", ".join(st.session_state.pdf_info["names"]) if st.session_state.pdf_info else None
+                        save_message(
+                            st.session_state.session_id, pdf_name,
+                            user_question, combined_answer,
+                            sources=classic_sources,
+                        )
+                        ts_now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        st.session_state.chat_history.append({
+                            "question": user_question,
+                            "answer": combined_answer,
+                            "sources": json.dumps(classic_sources, ensure_ascii=False),
+                            "timestamp": ts_now,
+                            "is_compare": True,
+                            "classic_answer": classic_answer,
+                            "graph_answer": graph_answer,
+                            "classic_sources": json.dumps(classic_sources, ensure_ascii=False),
+                            "graph_sources": json.dumps(graph_sources, ensure_ascii=False),
+                        })
+                        _mark_sessions_dirty()
+                        st.rerun()
+
+                    except Exception as e:
+                        st.error(f"Lỗi khi gọi model: {e}")
+                        st.caption("Kiểm tra Ollama đang chạy và model đã được pull chưa.")
+
+            # ══════════════════════════════════════════════════
+            # NORMAL MODE: Classic / Self-RAG
+            # ══════════════════════════════════════════════════
+            else:
+                full_answer = ""
+                sources_data = []
+                with st.chat_message("assistant"):
+                    answer_placeholder = st.empty()
+                    answer_placeholder.markdown(" Đang tìm câu trả lời...")
+                    try:
+                        for chunk in ask_question_stream_with_sources(
+                            user_question,
+                            st.session_state.retriever,
+                            chat_history=st.session_state.chat_history,
+                        ):
+                            if chunk.startswith("@@CONFIDENCE@@"):
+                                score = float(chunk.replace("@@CONFIDENCE@@", ""))
+                                st.caption(f" Confidence: {score:.2f}")
+                                continue
+                            if chunk.startswith("@@SOURCES@@"):
+                                sources_data = json.loads(chunk[len("@@SOURCES@@"):])
+                                continue
+                            full_answer += chunk
+                            answer_placeholder.markdown(full_answer + "▌")
+
+                        answer_placeholder.markdown(full_answer)
+                        _render_sources(sources_data, question=user_question)
+
+                        pdf_name = ", ".join(st.session_state.pdf_info["names"]) if st.session_state.pdf_info else None
+                        save_message(st.session_state.session_id, pdf_name,
+                                     user_question, full_answer, sources=sources_data)
+                        ts_now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        st.session_state.chat_history.append({
+                            "question": user_question,
+                            "answer": full_answer,
+                            "sources": json.dumps(sources_data, ensure_ascii=False) if sources_data else None,
+                            "timestamp": ts_now,
+                        })
+                        _mark_sessions_dirty()
+                        st.rerun()
+
+                    except Exception as e:
+                        answer_placeholder.error(f"Lỗi khi gọi model: {e}")
+                        st.caption("Kiểm tra Ollama đang chạy và model đã được pull chưa.")
