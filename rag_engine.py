@@ -3,6 +3,7 @@ import re
 import json
 import numpy as np
 import networkx as nx
+from functools import lru_cache
 from typing import Generator
 
 from langchain_community.document_loaders import PDFPlumberLoader
@@ -18,14 +19,17 @@ try:
 except ImportError:
     from langchain_community.embeddings import HuggingFaceEmbeddings
 
-# ── Cấu hình tập trung ────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# CẤU HÌNH TẬP TRUNG
+# ══════════════════════════════════════════════════════════════
+
 CONFIG = {
     "embedding_model": "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
     "embedding_device": "cpu",
     "chunk_size": 1000,
     "chunk_overlap": 100,
-    "retriever_k": 3,
-    "llm_model": "qwen2.5:3b",
+    "retriever_k": 5,
+    "llm_model": "qwen2.5:7b",
     "llm_temperature": 0.3,
     "ollama_host": os.environ.get("OLLAMA_HOST", "http://localhost:11434"),
     "use_rerank": False,
@@ -37,10 +41,13 @@ CONFIG = {
 _VIET_CHARS = "àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ"
 
 # ══════════════════════════════════════════════════════════════
-# 1. EMBEDDING MODEL
+# 1. EMBEDDING MODEL & LLM — SINGLETON CÓ CACHE
 # ══════════════════════════════════════════════════════════════
 
 _embedder = None
+_cross_encoder = None
+_llm_instance = None
+_llm_config_key = None   # track khi config thay đổi
 
 
 def get_embedder() -> HuggingFaceEmbeddings:
@@ -54,34 +61,74 @@ def get_embedder() -> HuggingFaceEmbeddings:
     return _embedder
 
 
-_cross_encoder = None
-
-
-def get_cross_encoder():
+def get_cross_encoder() -> CrossEncoder:
     global _cross_encoder
     if _cross_encoder is None:
         _cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
     return _cross_encoder
 
 
+def _get_llm() -> Ollama:
+    """
+    FIX: Cache LLM instance — tránh tạo mới mỗi lần gọi.
+    Chỉ tạo lại khi config thay đổi (model / host / temperature).
+    """
+    global _llm_instance, _llm_config_key
+    current_key = (CONFIG["llm_model"], CONFIG["ollama_host"], CONFIG["llm_temperature"])
+    if _llm_instance is None or _llm_config_key != current_key:
+        _llm_instance = Ollama(
+            model=CONFIG["llm_model"],
+            base_url=CONFIG["ollama_host"],
+            temperature=CONFIG["llm_temperature"],
+        )
+        _llm_config_key = current_key
+    return _llm_instance
+
+
 # ══════════════════════════════════════════════════════════════
 # 2. XỬ LÝ TÀI LIỆU
 # ══════════════════════════════════════════════════════════════
 
+def _clean_text(text: str) -> str:
+    """
+    FIX QUAN TRỌNG: Làm sạch text trước khi đưa vào chunk/context.
+    - Xóa nhiều newline liên tiếp → 1 newline
+    - Xóa khoảng trắng thừa
+    - Xóa các ký tự control không in được
+    """
+    # Xóa ký tự control (trừ newline và tab)
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    # Chuẩn hóa nhiều newline → tối đa 2
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    # Chuẩn hóa nhiều space liên tiếp → 1
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    # Xóa dòng chỉ có số trang / header lặp lại (pattern: dòng có 1-4 ký tự)
+    text = re.sub(r'(?m)^\s{0,2}\d{1,4}\s*$', '', text)
+    return text.strip()
+
+
 def process_pdf(file_path: str, embedder, chunk_size: int = None, chunk_overlap: int = None) -> tuple:
-    """Đọc PDF → chunk. Trả về: (chunks, num_pages, num_chunks)"""
+    """Đọc PDF → clean → chunk. Trả về: (chunks, num_pages, num_chunks)"""
     loader = PDFPlumberLoader(file_path)
     docs = loader.load()
+
+    # FIX: Clean text mỗi document trước khi split
+    for doc in docs:
+        doc.page_content = _clean_text(doc.page_content)
+
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size or CONFIG["chunk_size"],
         chunk_overlap=chunk_overlap or CONFIG["chunk_overlap"],
+        separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""],  # separator tốt hơn
     )
     chunks = splitter.split_documents(docs)
+    # Lọc bỏ chunks quá ngắn (< 50 ký tự) — thường là header/footer
+    chunks = [c for c in chunks if len(c.page_content.strip()) >= 50]
     return chunks, len(docs), len(chunks)
 
 
 def process_docx(file_path: str, embedder, chunk_size: int = None, chunk_overlap: int = None) -> tuple:
-    """Đọc DOCX → chunk. Trả về: (chunks, num_pages, num_chunks)"""
+    """Đọc DOCX → clean → chunk. Trả về: (chunks, num_pages, num_chunks)"""
     from langchain_community.document_loaders import Docx2txtLoader
     import docx
 
@@ -90,16 +137,21 @@ def process_docx(file_path: str, embedder, chunk_size: int = None, chunk_overlap
     loader = Docx2txtLoader(file_path)
     docs = loader.load()
 
+    for doc in docs:
+        doc.page_content = _clean_text(doc.page_content)
+
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size or CONFIG["chunk_size"],
         chunk_overlap=chunk_overlap or CONFIG["chunk_overlap"],
+        separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""],
     )
     chunks = splitter.split_documents(docs)
+    chunks = [c for c in chunks if len(c.page_content.strip()) >= 50]
 
     try:
-        doc = docx.Document(file_path)
-        total_chars = sum(len(p.text.strip()) for p in doc.paragraphs if p.text.strip())
-        for table in doc.tables:
+        doc_obj = docx.Document(file_path)
+        total_chars = sum(len(p.text.strip()) for p in doc_obj.paragraphs if p.text.strip())
+        for table in doc_obj.tables:
             for row in table.rows:
                 for cell in row.cells:
                     total_chars += len(cell.text.strip())
@@ -112,63 +164,67 @@ def process_docx(file_path: str, embedder, chunk_size: int = None, chunk_overlap
 
 
 def build_hybrid_retriever(chunks, embedder):
-    """Xây Hybrid Retriever (FAISS + BM25)."""
+    """
+    Xây Hybrid Retriever (FAISS + BM25).
+    FIX: Trọng số 0.3 BM25 / 0.7 FAISS — semantic search quan trọng hơn
+    BM25 với tiếng Việt không tốt bằng dense retrieval nên giảm trọng số.
+    """
     vector_store = FAISS.from_documents(chunks, embedder)
     faiss_retriever = vector_store.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": CONFIG["retriever_k"]},
+        search_type="mmr",   # FIX: dùng MMR để tránh duplicate kết quả
+        search_kwargs={"k": CONFIG["retriever_k"], "fetch_k": CONFIG["retriever_k"] * 3},
     )
     bm25_retriever = BM25Retriever.from_documents(chunks)
     bm25_retriever.k = CONFIG["retriever_k"]
 
     hybrid_retriever = EnsembleRetriever(
         retrievers=[bm25_retriever, faiss_retriever],
-        weights=[0.5, 0.5],
+        weights=[0.3, 0.7],   # FIX: tăng weight cho semantic search
     )
     return hybrid_retriever
 
 
 # ══════════════════════════════════════════════════════════════
-# 3. GRAPH RAG — Xây đồ thị thực thể bằng LLM + Embedding Retrieval
+# 3. GRAPH RAG
 # ══════════════════════════════════════════════════════════════
 
 def _extract_entities_and_relations_llm(text: str, llm) -> list[dict]:
     """
-    Dùng LLM (Qwen) để trích xuất entities và relationships có ngữ nghĩa thực sự.
-
-    Trả về list of {"e1": str, "rel": str, "e2": str}
-    Ví dụ: {"e1": "FAISS", "rel": "lưu trữ", "e2": "vector embeddings"}
-
-    Fallback về regex nếu LLM parse thất bại.
+    Dùng LLM để trích xuất entities và relationships.
+    FIX: Prompt rõ ràng hơn, giảm text xuống 500 chars để Qwen 7B trả lời nhanh hơn.
     """
     prompt = f"""Extract key entities and their relationships from the text below.
-Return ONLY a JSON array, no explanation, no markdown.
+Return ONLY a JSON array, no explanation, no markdown, no preamble.
 Format: [{{"e1": "entity1", "rel": "relationship", "e2": "entity2"}}]
 Rules:
-- e1 and e2 must be specific concepts, tools, methods, or named things (not generic words)
-- rel must be a short verb phrase describing how e1 relates to e2
-- Extract 3 to 8 relationships maximum
-- If text is in Vietnamese, keep entities in Vietnamese
+- e1 and e2 must be specific concepts, tools, methods, or named things (NOT generic words like "system", "method", "data")
+- rel must be a short verb phrase (2-5 words) describing how e1 relates to e2
+- Extract 3 to 6 relationships maximum
+- Keep entities in the same language as the text
 
 Text:
-{text[:600]}
+{text[:500]}
 
-JSON:"""
+JSON array only:"""
     try:
         raw = llm.invoke(prompt).strip()
-        # Bỏ markdown fence nếu có
+        # Bỏ markdown fence
         raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+        # Tìm JSON array trong response nếu có text thừa
+        match = re.search(r'\[.*\]', raw, re.DOTALL)
+        if match:
+            raw = match.group()
         relations = json.loads(raw)
-        # Validate: phải là list of dict với 3 keys
         valid = [
             r for r in relations
             if isinstance(r, dict)
             and all(k in r for k in ("e1", "rel", "e2"))
             and r["e1"].strip() and r["e2"].strip()
+            and len(r["e1"]) > 2 and len(r["e2"]) > 2
         ]
-        return valid[:8]
+        return valid[:6]
     except Exception:
-        # Fallback: chỉ extract acronym + Title Case làm entities đơn
+        # Fallback: extract acronym + Title Case
         entities = list(set(
             re.findall(r'\b[A-Z]{2,}\b', text) +
             re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', text)
@@ -177,31 +233,17 @@ JSON:"""
         for i in range(len(entities)):
             for j in range(i + 1, len(entities)):
                 relations.append({"e1": entities[i], "rel": "related_to", "e2": entities[j]})
-        return relations[:8]
+        return relations[:6]
 
 
 def build_graph_rag(chunks: list) -> nx.Graph:
     """
     Xây Knowledge Graph từ chunks bằng LLM-based entity extraction.
-
-    Kiến trúc chuẩn Graph RAG (Microsoft 2024):
-    - Node: entity thực sự (tên công cụ, khái niệm, phương pháp)
-    - Edge: relationship có ngữ nghĩa ("sử dụng", "là thành phần của", ...)
-    - Node attribute:
-        * chunks  : list các đoạn văn chứa entity này
-        * embedding: vector của entity name (để semantic search)
-    - Edge attribute:
-        * rel     : tên quan hệ
-        * weight  : số lần quan hệ này xuất hiện
-
-    Retrieve sau này dùng embedding similarity thay vì keyword match.
+    Kiến trúc chuẩn Graph RAG (Microsoft 2024).
     """
     llm = _get_llm()
     embedder = get_embedder()
     G = nx.Graph()
-
-    # Batch size nhỏ để không quá tải Qwen 3b
-    BATCH = 1
 
     for idx, chunk in enumerate(chunks):
         text = chunk.page_content
@@ -221,19 +263,16 @@ def build_graph_rag(chunks: list) -> nx.Graph:
             e2 = rel["e2"].strip()
             relationship = rel["rel"].strip()
 
-            # ── Thêm / cập nhật node e1 ──────────────────────
             if G.has_node(e1):
                 G.nodes[e1]["chunks"].append(chunk_data)
             else:
                 G.add_node(e1, chunks=[chunk_data], label=e1)
 
-            # ── Thêm / cập nhật node e2 ──────────────────────
             if G.has_node(e2):
                 G.nodes[e2]["chunks"].append(chunk_data)
             else:
                 G.add_node(e2, chunks=[chunk_data], label=e2)
 
-            # ── Thêm / cập nhật edge ─────────────────────────
             if G.has_edge(e1, e2):
                 G[e1][e2]["weight"] += 1
                 if relationship not in G[e1][e2]["rels"]:
@@ -241,7 +280,7 @@ def build_graph_rag(chunks: list) -> nx.Graph:
             else:
                 G.add_edge(e1, e2, weight=1, rels=[relationship])
 
-    # ── Tính embedding cho từng node (batch) ─────────────────
+    # Tính embedding cho từng node (batch)
     node_list = list(G.nodes())
     if node_list:
         try:
@@ -249,19 +288,12 @@ def build_graph_rag(chunks: list) -> nx.Graph:
             for node, emb in zip(node_list, node_embeddings):
                 G.nodes[node]["embedding"] = emb
         except Exception:
-            pass  # Nếu embedding lỗi vẫn hoạt động được (fallback keyword)
+            pass
 
     return G
 
 
 def _score_chunk(content: str, keywords: list) -> float:
-    """
-    Tính relevance score của một chunk dựa trên 3 tín hiệu:
-      - coverage  : tỉ lệ keywords xuất hiện trong chunk     [0,1]
-      - hits_norm : số hits normalized theo tổng keywords    [0,1]
-      - density   : mật độ keyword so với độ dài chunk       [0,1]
-    Trả về float trong [0, 1].
-    """
     if not keywords or not content:
         return 0.0
     content_lower = content.lower()
@@ -269,59 +301,40 @@ def _score_chunk(content: str, keywords: list) -> float:
     hits = sum(1 for kw in keywords if kw in content_lower)
     if hits == 0:
         return 0.0
-    coverage       = hits / len(keywords)
-    hits_norm      = min(hits / len(keywords), 1.0)
-    density        = min(hits / (word_count / 50), 1.0)   # ~1 hit/50 words = max density
+    coverage  = hits / len(keywords)
+    hits_norm = min(hits / len(keywords), 1.0)
+    density   = min(hits / (word_count / 50), 1.0)
     return 0.5 * coverage + 0.3 * hits_norm + 0.2 * density
 
 
 def _graph_retrieve(question: str, graph: nx.Graph, top_k: int = 6) -> list[dict]:
     """
-    Graph RAG Retrieval — 3 tầng theo đúng chuẩn Microsoft GraphRAG:
-
-    Tầng 1 — Semantic Node Matching (embedding similarity):
-        Embed câu hỏi → so sánh cosine similarity với embedding của từng node.
-        Node nào similarity cao nhất → "seed nodes".
-        Đây là điểm khác biệt cốt lõi so với keyword matching cũ.
-
-    Tầng 2 — Graph Traversal (neighbor expansion):
-        Từ seed nodes, duyệt sang neighbors trong graph.
-        Neighbor được chọn dựa trên edge weight (số lần đồng xuất hiện trong LLM extraction).
-        Mang lại thông tin liên quan gián tiếp mà pure vector search bỏ sót.
-
-    Tầng 3 — Chunk Deduplication + Ranking:
-        Gom tất cả chunks từ seed + neighbor nodes.
-        Score = node_similarity × node_weight + neighbor_bonus.
-        Deduplicate theo chunk_idx, giữ score cao nhất.
-
-    Fallback: nếu không có node nào có embedding (graph cũ hoặc lỗi),
-    tự động về keyword scoring để không crash.
+    Graph RAG Retrieval — 3 tầng:
+    Tầng 1: Semantic Node Matching (embedding similarity)
+    Tầng 2: Graph Traversal (neighbor expansion)
+    Tầng 3: Chunk Deduplication + Ranking
     """
-    MIN_SIM       = 0.25   # ngưỡng cosine similarity để chọn seed node
-    MAX_SEED      = 5      # tối đa seed nodes
-    MAX_NEIGHBORS = 3      # tối đa neighbors per seed
+    MIN_SIM       = 0.25
+    MAX_SEED      = 5
+    MAX_NEIGHBORS = 3
 
     node_list = list(graph.nodes())
     if not node_list:
         return []
 
-    # ── Tầng 1: Semantic Node Matching ───────────────────────
-    # Lấy embeddings của nodes (đã tính lúc build_graph_rag)
     nodes_with_emb = [
         (n, graph.nodes[n]["embedding"])
         for n in node_list
         if "embedding" in graph.nodes[n]
     ]
 
-    seed_nodes: dict = {}   # node → similarity score
+    seed_nodes: dict = {}
 
     if nodes_with_emb:
-        # Embed câu hỏi
         embedder = get_embedder()
         q_emb = np.array(embedder.embed_query(question))
         q_norm = np.linalg.norm(q_emb)
 
-        # Tính cosine similarity với tất cả nodes
         for node, node_emb in nodes_with_emb:
             n_emb = np.array(node_emb)
             n_norm = np.linalg.norm(n_emb)
@@ -331,12 +344,10 @@ def _graph_retrieve(question: str, graph: nx.Graph, top_k: int = 6) -> list[dict
             if sim >= MIN_SIM:
                 seed_nodes[node] = sim
 
-        # Giữ top MAX_SEED seeds
         seed_nodes = dict(
             sorted(seed_nodes.items(), key=lambda x: x[1], reverse=True)[:MAX_SEED]
         )
     else:
-        # Fallback: không có embedding → dùng keyword match đơn giản
         keywords = [
             w.lower() for w in re.findall(r'[\w\u00C0-\u024F\u1E00-\u1EFF]+', question)
             if len(w) >= 4
@@ -347,7 +358,6 @@ def _graph_retrieve(question: str, graph: nx.Graph, top_k: int = 6) -> list[dict
                 seed_nodes[node] = 0.7
 
     if not seed_nodes:
-        # Không tìm được seed nào → fallback lấy tất cả chunks rank bằng keyword
         keywords = [
             w.lower() for w in re.findall(r'[\w\u00C0-\u024F\u1E00-\u1EFF]+', question)
             if len(w) >= 3
@@ -362,39 +372,34 @@ def _graph_retrieve(question: str, graph: nx.Graph, top_k: int = 6) -> list[dict
         ranked_fb = sorted(all_chunks.values(), key=lambda x: x[0], reverse=True)
         return [ci for _, ci in ranked_fb[:top_k] if _ > 0]
 
-    # ── Tầng 2: Graph Traversal ────────────────────────────────
-    neighbor_nodes: dict = {}   # node → neighbor_score
+    neighbor_nodes: dict = {}
     for node, sim in seed_nodes.items():
         nbrs = list(graph.neighbors(node))
         if not nbrs:
             continue
-        # Sort neighbors theo edge weight (LLM-extracted relation frequency)
         nbrs_sorted = sorted(
             nbrs,
             key=lambda n: graph[node][n].get("weight", 0),
-            reverse=True
+            reverse=True,
         )
         max_w = graph[node][nbrs_sorted[0]].get("weight", 1) if nbrs_sorted else 1
         for nb in nbrs_sorted[:MAX_NEIGHBORS]:
             if nb in seed_nodes:
-                continue   # đã là seed, không cần ghi đè
+                continue
             edge_w = graph[node][nb].get("weight", 1)
-            # Neighbor score = seed_sim × 0.6 × (relative edge weight)
             nb_score = sim * 0.6 * (edge_w / max_w)
             if nb not in neighbor_nodes or neighbor_nodes[nb] < nb_score:
                 neighbor_nodes[nb] = nb_score
 
-    # ── Tầng 3: Gom chunks + Dedup + Rank ─────────────────────
-    chunk_scores: dict = {}   # chunk_idx → (score, chunk_data)
+    chunk_scores: dict = {}
 
     for node, sim in seed_nodes.items():
         if not graph.has_node(node):
             continue
         for ci in graph.nodes[node].get("chunks", []):
             idx = ci["chunk_idx"]
-            final = sim   # score = cosine similarity của seed node
-            if idx not in chunk_scores or chunk_scores[idx][0] < final:
-                chunk_scores[idx] = (final, ci)
+            if idx not in chunk_scores or chunk_scores[idx][0] < sim:
+                chunk_scores[idx] = (sim, ci)
 
     for node, nb_score in neighbor_nodes.items():
         if not graph.has_node(node):
@@ -417,18 +422,24 @@ def _detect_language(text: str) -> str:
 
 
 def _build_prompt(language: str) -> PromptTemplate:
+    """
+    FIX CHÍNH: Prompt được cải thiện triệt để.
+    - Yêu cầu độ dài tối thiểu (không được trả lời 1-2 câu ngắn)
+    - Yêu cầu format có cấu trúc rõ ràng
+    - Hướng dẫn rõ cách xử lý từng tình huống
+    - Chain-of-thought nhẹ: "Phân tích ngữ cảnh trước, sau đó trả lời"
+    """
     if language == "vi":
-        template = """Bạn là trợ lý chuyên phân tích tài liệu. 
-Nhiệm vụ của bạn là: 
-- Trả lời câu hỏi DỰA HOÀN TOÀN vào ngữ cảnh được cung cấp bên dưới.
+        template = """Bạn là chuyên gia phân tích tài liệu. Hãy đọc kỹ NGỮ CẢNH và trả lời CÂU HỎI một cách CHÍNH XÁC, ĐẦY ĐỦ, CÓ CẤU TRÚC.
 
-QUY TẮC:
-- Chỉ sử dụng thông tin có trong [NGỮ CẢNH]. Không thêm kiến thức bên ngoài.
-- Nếu ngữ cảnh có đủ thông tin: trả lời đầy đủ, có cấu trúc rõ ràng.
-- Nếu ngữ cảnh chỉ có một phần: trả lời phần biết, nói rõ phần nào không có trong tài liệu.
-- Nếu ngữ cảnh không có thông tin liên quan: trả lời "Tài liệu không đề cập đến vấn đề này."
-- Trích dẫn ý chính từ ngữ cảnh khi cần thiết để tăng độ tin cậy.
-- Nếu câu hỏi là follow-up, hãy suy luận từ [HỘI THOẠI TRƯỚC]
+NGUYÊN TẮC BẮT BUỘC:
+1. CHỈ dùng thông tin có trong [NGỮ CẢNH]. Tuyệt đối không thêm kiến thức ngoài.
+2. Trả lời bằng TIẾNG VIỆT, tối thiểu 3-5 câu đầy đủ, có cấu trúc rõ ràng.
+3. Nếu ngữ cảnh đủ thông tin → trả lời đầy đủ, dùng gạch đầu dòng hoặc đánh số khi liệt kê.
+4. Nếu ngữ cảnh có một phần → trả lời phần có, ghi rõ: "Tài liệu không đề cập đến [phần thiếu]."
+5. Nếu ngữ cảnh không liên quan → trả lời: "Tài liệu không đề cập đến vấn đề này."
+6. Với câu hỏi follow-up → kết hợp [HỘI THOẠI TRƯỚC] và [NGỮ CẢNH] để trả lời liền mạch.
+7. KHÔNG lặp lại câu hỏi trong câu trả lời. KHÔNG viết "Dựa vào ngữ cảnh..." ở đầu.
 
 [HỘI THOẠI TRƯỚC]
 {chat_history}
@@ -441,17 +452,16 @@ QUY TẮC:
 
 [TRẢ LỜI]"""
     else:
-        template = """You are a document analysis assistant. 
-Your task is:
-- Answer the question BASED ENTIRELY ON the [CONTEXT] provided below.
+        template = """You are a document analysis expert. Read the CONTEXT carefully and answer the QUESTION accurately, completely, and with clear structure.
 
-RULES:
-- Only use information present in [CONTEXT]. Do not add outside knowledge.
-- If context has enough info: answer fully with clear structure.
-- If context has partial info: answer what you can, clearly state what's missing.
-- If context has no relevant info: respond "The document does not mention this topic."
-- Quote key phrases from the context when it strengthens your answer.
-- If the question is follow-up, infer from the [HISTORY].
+MANDATORY RULES:
+1. ONLY use information present in [CONTEXT]. Never add outside knowledge.
+2. Answer in ENGLISH with minimum 3-5 complete sentences, well-structured.
+3. If context has enough info → answer fully, use bullet points or numbering for lists.
+4. If context has partial info → answer what you can, clearly state: "The document does not mention [missing part]."
+5. If context has no relevant info → respond: "The document does not mention this topic."
+6. For follow-up questions → combine [HISTORY] and [CONTEXT] for a coherent answer.
+7. DO NOT repeat the question. DO NOT start with "Based on the context...".
 
 [HISTORY]
 {chat_history}
@@ -470,24 +480,23 @@ RULES:
 def _build_graph_prompt(language: str) -> PromptTemplate:
     """
     Prompt riêng cho Graph RAG — nhấn mạnh khai thác quan hệ giữa các thực thể.
-    Yêu cầu mô tả MỐI LIÊN HỆ, SO SÁNH và trả lời ĐẦY ĐỦ hơn Classic RAG.
+    FIX: Thêm yêu cầu rõ về độ dài và format.
     """
     if language == "vi":
-        template = """Bạn là trợ lý phân tích tài liệu chuyên sâu, sử dụng Graph RAG.
-Các đoạn văn dưới đây được chọn dựa trên QUAN HỆ giữa các thực thể trong tài liệu.
+        template = """Bạn là chuyên gia phân tích tài liệu sử dụng Graph RAG. Các đoạn văn dưới đây được chọn dựa trên MỐI QUAN HỆ giữa các thực thể trong tài liệu.
 
-NHIỆM VỤ: Trả lời câu hỏi dựa trên ngữ cảnh, đặc biệt chú ý:
-- Mô tả MỐI LIÊN HỆ giữa các khái niệm/thực thể khi có thể
+NHIỆM VỤ: Trả lời câu hỏi, đặc biệt chú ý:
+- Mô tả MỐI LIÊN HỆ và SỰ KẾT NỐI giữa các khái niệm/thực thể
 - Giải thích TẠI SAO các thực thể liên quan đến nhau
 - So sánh, đối chiếu nếu có nhiều thực thể cùng loại
-- Trả lời ĐẦY ĐỦ và CHI TIẾT, có cấu trúc rõ ràng (dùng gạch đầu dòng hoặc đánh số nếu cần)
+- Tổng hợp thông tin từ NHIỀU đoạn khác nhau
 
-QUY TẮC:
-- Chỉ dùng thông tin trong [NGỮ CẢNH]. Không thêm kiến thức ngoài.
-- Nếu ngữ cảnh đủ thông tin: PHÂN TÍCH SÂU, không trả lời ngắn.
-- Nếu ngữ cảnh thiếu: trả lời phần có, ghi rõ phần không có trong tài liệu.
-- Nếu không có thông tin: "Tài liệu không đề cập đến vấn đề này."
-- Ưu tiên liên kết thông tin từ NHIỀU đoạn khác nhau.
+NGUYÊN TẮC BẮT BUỘC:
+1. CHỈ dùng thông tin trong [NGỮ CẢNH]. Không thêm kiến thức ngoài.
+2. Trả lời bằng TIẾNG VIỆT, ĐẦY ĐỦ và CÓ CẤU TRÚC (gạch đầu dòng hoặc đánh số khi cần).
+3. Tối thiểu 4-6 câu, phân tích sâu các mối quan hệ.
+4. Nếu không có thông tin liên quan: "Tài liệu không đề cập đến vấn đề này."
+5. KHÔNG viết "Dựa vào ngữ cảnh..." hay lặp lại câu hỏi.
 
 [HỘI THOẠI TRƯỚC]
 {chat_history}
@@ -500,21 +509,20 @@ QUY TẮC:
 
 [TRẢ LỜI — Phân tích đầy đủ, có cấu trúc]"""
     else:
-        template = """You are a document analysis assistant using Graph RAG.
-The passages below are selected based on RELATIONSHIPS between entities in the document.
+        template = """You are a document analysis expert using Graph RAG. The passages below were selected based on RELATIONSHIPS between entities in the document.
 
-TASK: Answer the question with special attention to:
-- Describing RELATIONSHIPS between concepts/entities when possible
-- Explaining WHY entities are related
-- Comparing and contrasting when multiple similar entities exist
-- Giving COMPLETE, DETAILED answers with clear structure (use bullets or numbering)
+TASK: Answer the question with special focus on:
+- Describing RELATIONSHIPS and CONNECTIONS between concepts/entities
+- Explaining WHY entities are related to each other
+- Comparing and contrasting similar entities
+- Synthesizing information ACROSS multiple passages
 
-RULES:
-- Only use information in [CONTEXT]. No outside knowledge.
-- If context is sufficient: give a DEEP ANALYSIS, not a short answer.
-- If context is partial: answer what you can, clearly note what's missing.
-- If no relevant info: "The document does not mention this topic."
-- Prioritize linking information ACROSS multiple passages.
+MANDATORY RULES:
+1. ONLY use information in [CONTEXT]. No outside knowledge.
+2. Answer in ENGLISH, fully and with CLEAR STRUCTURE (use bullets or numbering for lists).
+3. Minimum 4-6 sentences with deep relationship analysis.
+4. If no relevant info: "The document does not mention this topic."
+5. DO NOT write "Based on the context..." or repeat the question.
 
 [HISTORY]
 {chat_history}
@@ -529,18 +537,57 @@ RULES:
 
     return PromptTemplate(
         template=template,
-        input_variables=["context", "question", "chat_history", "num_chunks"]
+        input_variables=["context", "question", "chat_history", "num_chunks"],
     )
 
 
 def _format_chat_history(chat_history: list, max_turns: int = 3) -> str:
+    """
+    FIX QUAN TRỌNG:
+    - Chỉ lấy max_turns câu gần nhất
+    - Truncate answer dài (tối đa 200 ký tự) để tránh ăn context window
+    - Skip các compare-mode answer (quá dài và nhiễu)
+    """
     if not chat_history:
-        return ""
+        return "Không có lịch sử hội thoại."
+
     history_text = []
-    for item in chat_history[-max_turns:]:
-        history_text.append(f"User: {item.get('question', '')}")
-        history_text.append(f"Assistant: {item.get('answer', '')}")
-    return "\n".join(history_text)
+    recent = chat_history[-max_turns:]
+
+    for item in recent:
+        q = item.get("question", "").strip()
+        a = item.get("answer", "").strip()
+        if not q:
+            continue
+
+        # Skip compare-mode answers (chứa "**Classic RAG:**")
+        if "**Classic RAG:**" in a or "**Graph RAG:**" in a:
+            continue
+
+        # Truncate answer dài
+        if len(a) > 200:
+            a = a[:200].rsplit(" ", 1)[0] + "..."
+
+        history_text.append(f"User: {q}")
+        history_text.append(f"Assistant: {a}")
+
+    return "\n".join(history_text) if history_text else "Không có lịch sử hội thoại."
+
+
+def _build_context(source_docs) -> str:
+    """
+    FIX: Build context có đánh số đoạn văn rõ ràng.
+    Giúp LLM dễ tham chiếu hơn khi trả lời.
+    """
+    parts = []
+    for i, doc in enumerate(source_docs, 1):
+        page = doc.metadata.get("page", "?")
+        if isinstance(page, int):
+            page = page + 1
+        source = os.path.basename(doc.metadata.get("source", ""))
+        header = f"[Đoạn {i} — Trang {page}" + (f" | {source}" if source else "") + "]"
+        parts.append(f"{header}\n{doc.page_content.strip()}")
+    return "\n\n---\n\n".join(parts)
 
 
 def rerank_documents(question: str, docs: list, top_k: int = 5):
@@ -553,14 +600,6 @@ def rerank_documents(question: str, docs: list, top_k: int = 5):
         doc.metadata["rerank_score"] = float(score)
     docs = sorted(docs, key=lambda x: x.metadata["rerank_score"], reverse=True)
     return docs[:top_k]
-
-
-def _get_llm():
-    return Ollama(
-        model=CONFIG["llm_model"],
-        base_url=CONFIG["ollama_host"],
-        temperature=CONFIG["llm_temperature"],
-    )
 
 
 # ══════════════════════════════════════════════════════════════
@@ -578,18 +617,18 @@ def ask_question_stream_with_sources(
     prompt = _build_prompt(lang)
     history_text = _format_chat_history(chat_history or [])
 
-    # 1. Lấy đủ candidates để rerank sau này
+    # 1. Retrieve candidates
     retrieved_docs = retriever.invoke(question)[:20]
 
-    # 2. Áp dụng filter selected_file (nếu người dùng chọn 1 file cụ thể)
+    # 2. Filter theo selected_file
     selected_file = CONFIG.get("selected_file", "All")
     if selected_file != "All":
         retrieved_docs = [
-            d for d in retrieved_docs 
+            d for d in retrieved_docs
             if d.metadata.get("source") == selected_file
         ]
 
-    # 3. Self-RAG path (giữ nguyên)
+    # 3. Self-RAG path
     if CONFIG.get("use_self_rag", False):
         answer, score, context, docs = self_rag_pipeline(question, retriever, chat_history)
         yield answer
@@ -606,46 +645,56 @@ def ask_question_stream_with_sources(
         yield "@@CONFIDENCE@@" + str(score)
         return
 
-    # 4. Rerank hoặc lấy đúng top-k
+    # 4. Rerank hoặc lấy top-k
     if CONFIG.get("use_rerank", False):
-        source_docs = rerank_documents(
-            question, 
-            retrieved_docs, 
-            top_k=CONFIG["retriever_k"]
-        )
+        source_docs = rerank_documents(question, retrieved_docs, top_k=CONFIG["retriever_k"])
     else:
         source_docs = retrieved_docs[:CONFIG["retriever_k"]]
 
-    # Xây context và prompt
-    context = "\n\n".join(d.page_content for d in source_docs)
+    if not source_docs:
+        no_info = "Không tìm thấy thông tin liên quan trong tài liệu." if lang == "vi" else "No relevant information found in the document."
+        yield no_info
+        yield "@@SOURCES@@" + json.dumps([], ensure_ascii=False)
+        return
+
+    # FIX: Dùng _build_context để có header đánh số
+    context = _build_context(source_docs)
+
     filled_prompt = prompt.format(
-        context=context, 
-        question=question, 
-        chat_history=history_text
+        context=context,
+        question=question,
+        chat_history=history_text,
     )
 
-    # Stream câu trả lời
+    # FIX CRITICAL: Stream đúng cách
+    # Ollama.stream() yield từng token string, KHÔNG phải character
     llm = _get_llm()
-    for chunk in llm.stream(filled_prompt):
-        for c in chunk:
-            yield c
+    try:
+        for token in llm.stream(filled_prompt):
+            # token là string, yield trực tiếp
+            if token:
+                yield token
+    except Exception as e:
+        yield f"\n\n[Lỗi khi gọi model: {e}]"
+        return
 
     # Trả sources
     sources = [
         {
             "index": i + 1,
-            "page": meta.get("page", "?"),
-            "source": file_name or os.path.basename(meta.get("source", "unknown")),
+            "page": (doc.metadata.get("page", "?") + 1)
+                    if isinstance(doc.metadata.get("page"), int)
+                    else doc.metadata.get("page", "?"),
+            "source": file_name or os.path.basename(doc.metadata.get("source", "unknown")),
             "content": doc.page_content,
         }
         for i, doc in enumerate(source_docs)
-        for meta in [doc.metadata]
     ]
     yield "@@SOURCES@@" + json.dumps(sources, ensure_ascii=False)
 
 
 # ══════════════════════════════════════════════════════════════
-# 6. HỎI ĐÁP — GRAPH RAG (non-streaming, trả về string)
+# 6. HỎI ĐÁP — GRAPH RAG (non-streaming)
 # ══════════════════════════════════════════════════════════════
 
 def ask_graph_rag(
@@ -653,10 +702,7 @@ def ask_graph_rag(
     graph: nx.Graph,
     chat_history: list = None,
 ) -> tuple[str, list]:
-    """
-    Trả lời câu hỏi bằng Graph RAG.
-    Trả về: (answer_string, sources_list)
-    """
+    """Trả lời câu hỏi bằng Graph RAG. Trả về: (answer_string, sources_list)"""
     lang = _detect_language(question)
     prompt = _build_graph_prompt(lang)
     history_text = _format_chat_history(chat_history or [])
@@ -664,9 +710,13 @@ def ask_graph_rag(
     graph_chunks = _graph_retrieve(question, graph, top_k=CONFIG["retriever_k"])
 
     if not graph_chunks:
-        return "Graph RAG không tìm thấy thông tin liên quan trong đồ thị.", []
+        no_info = "Graph RAG không tìm thấy thông tin liên quan trong đồ thị." if lang == "vi" else "Graph RAG found no relevant information."
+        return no_info, []
 
-    context = "\n\n".join(c["content"] for c in graph_chunks)
+    context = "\n\n---\n\n".join(
+        f"[Đoạn {i+1} — Trang {c.get('page', '?')}]\n{c['content'].strip()}"
+        for i, c in enumerate(graph_chunks)
+    )
     filled_prompt = prompt.format(
         context=context,
         question=question,
@@ -700,11 +750,15 @@ def ask_compare_rag(
     graph: nx.Graph,
     chat_history: list = None,
 ) -> Generator[str, None, None]:
+    """
+    FIX: Stream đúng cách — llm.stream() yield token strings.
+    Dùng _build_context để context có cấu trúc rõ ràng.
+    """
     lang = _detect_language(question)
     history_text = _format_chat_history(chat_history or [])
     llm = _get_llm()
 
-    # ── Phần 1: Classic RAG 
+    # ── Phần 1: Classic RAG ──────────────────────────────────
     yield "@@CLASSIC_START@@"
 
     classic_docs = retriever.invoke(question)[:20]
@@ -717,20 +771,25 @@ def ask_compare_rag(
     else:
         source_docs = classic_docs[:CONFIG["retriever_k"]]
 
-    context_classic = "\n\n".join(d.page_content for d in source_docs)
+    context_classic = _build_context(source_docs)
     classic_prompt = _build_prompt(lang)
     filled_classic = classic_prompt.format(
-        context=context_classic, question=question, chat_history=history_text
+        context=context_classic,
+        question=question,
+        chat_history=history_text,
     )
 
-    for chunk in llm.stream(filled_classic):
-        for c in chunk:
-            yield c
+    # FIX: stream đúng — yield token trực tiếp
+    for token in llm.stream(filled_classic):
+        if token:
+            yield token
 
     classic_sources = [
         {
             "index": i + 1,
-            "page": doc.metadata.get("page", "?"),
+            "page": (doc.metadata.get("page", "?") + 1)
+                    if isinstance(doc.metadata.get("page"), int)
+                    else doc.metadata.get("page", "?"),
             "source": os.path.basename(str(doc.metadata.get("source", "unknown"))),
             "content": doc.page_content,
         }
@@ -738,28 +797,30 @@ def ask_compare_rag(
     ]
     yield "@@CLASSIC_SOURCES@@" + json.dumps(classic_sources, ensure_ascii=False)
 
-    # ── Phần 2: Graph RAG 
+    # ── Phần 2: Graph RAG ────────────────────────────────────
     yield "@@GRAPH_START@@"
 
-    graph_top_k = 10          
+    graph_top_k = CONFIG["retriever_k"] + 3
     graph_chunks = _graph_retrieve(question, graph, top_k=graph_top_k)
 
     if graph_chunks:
+        context_graph = "\n\n---\n\n".join(
+            f"[Đoạn {i+1} — Trang {c.get('page', '?')}]\n{c['content'].strip()}"
+            for i, c in enumerate(graph_chunks)
+        )
         graph_prompt = _build_graph_prompt(lang)
-        context_graph = "\n\n".join(c["content"] for c in graph_chunks)
         filled_graph = graph_prompt.format(
             context=context_graph,
             question=question,
             chat_history=history_text,
             num_chunks=len(graph_chunks),
         )
-        for chunk in llm.stream(filled_graph):
-            for c in chunk:
-                yield c
+        for token in llm.stream(filled_graph):
+            if token:
+                yield token
     else:
-        no_info = "Graph RAG không tìm thấy thông tin liên quan trong đồ thị."
-        for c in no_info:
-            yield c
+        no_info = "Graph RAG không tìm thấy thông tin liên quan trong đồ thị." if lang == "vi" else "Graph RAG found no relevant information."
+        yield no_info
         graph_chunks = []
 
     graph_sources = [
@@ -774,40 +835,42 @@ def ask_compare_rag(
     yield "@@GRAPH_SOURCES@@" + json.dumps(graph_sources, ensure_ascii=False)
     yield "@@COMPARE_DONE@@"
 
+
 # ══════════════════════════════════════════════════════════════
 # 8. SELF-RAG
 # ══════════════════════════════════════════════════════════════
 
 def rewrite_query(question: str, chat_history: str = "") -> str:
+    """FIX: Prompt ngắn gọn hơn, tránh LLM thêm thừa."""
     llm = _get_llm()
-    prompt = f"""Rewrite the question to be clearer and more specific for document retrieval.
-
-Chat History:
-{chat_history}
-
-Original Question:
-{question}
-
-Rewritten Question:"""
-    return llm.invoke(prompt).strip()
+    history_part = f"\nChat History:\n{chat_history}\n" if chat_history.strip() and chat_history != "Không có lịch sử hội thoại." else ""
+    prompt = f"""Rewrite the following question to be more specific and retrieval-friendly for a document search system. Output ONLY the rewritten question, nothing else.{history_part}
+Original: {question}
+Rewritten:"""
+    result = llm.invoke(prompt).strip()
+    # Nếu LLM trả lời quá dài (nhiều dòng), chỉ lấy dòng đầu
+    return result.split("\n")[0].strip() or question
 
 
 def evaluate_answer(question: str, answer: str, context: str) -> dict:
-    llm = Ollama(
-        model=CONFIG["llm_model"],
-        base_url=CONFIG["ollama_host"],
-        temperature=0.0,
-    )
-    prompt = f"""Evaluate the answer quality.
+    """FIX: Dùng _get_llm() thay vì tạo Ollama mới, tiết kiệm overhead."""
+    llm = _get_llm()
+    # Truncate để tránh prompt quá dài
+    ctx_short = context[:600] if len(context) > 600 else context
+    ans_short = answer[:300] if len(answer) > 300 else answer
+    prompt = f"""Score how well the answer addresses the question based on the context.
+Return ONLY JSON: {{"score": <0.0-1.0>, "reason": "<brief reason>"}}
 
 Question: {question}
-Context: {context}
-Answer: {answer}
+Context: {ctx_short}
+Answer: {ans_short}
 
-Score from 0 to 1. Return JSON only:
-{{"score": ..., "reason": "..."}}"""
-    result = llm.invoke(prompt)
+JSON:"""
+    result = llm.invoke(prompt).strip()
     try:
+        match = re.search(r'\{.*\}', result, re.DOTALL)
+        if match:
+            return json.loads(match.group())
         return json.loads(result)
     except Exception:
         return {"score": 0.5, "reason": "parse_error"}
@@ -815,26 +878,36 @@ Score from 0 to 1. Return JSON only:
 
 def self_rag_pipeline(question, retriever, chat_history=None):
     history_text = _format_chat_history(chat_history or [])
-    best_answer, best_score, best_context, best_docs = "", 0, "", []
+    best_answer, best_score, best_context, best_docs = "", 0.0, "", []
 
-    for _ in range(CONFIG["self_rag_max_iter"]):
-        new_query = rewrite_query(question, history_text)
-        docs = retriever.invoke(new_query)[:10]
+    for iteration in range(CONFIG["self_rag_max_iter"]):
+        # Rewrite query chỉ từ lần 2 trở đi
+        if iteration == 0:
+            search_query = question
+        else:
+            search_query = rewrite_query(question, history_text)
+
+        docs = retriever.invoke(search_query)[:10]
 
         if CONFIG.get("use_rerank", False):
-            docs = rerank_documents(new_query, docs)
+            docs = rerank_documents(search_query, docs, top_k=CONFIG["retriever_k"])
+        else:
+            docs = docs[:CONFIG["retriever_k"]]
 
-        context = "\n\n".join(d.page_content for d in docs)
+        context = _build_context(docs)
         prompt = _build_prompt(_detect_language(question))
         filled = prompt.format(context=context, question=question, chat_history=history_text)
 
         llm = _get_llm()
         answer = llm.invoke(filled)
         eval_result = evaluate_answer(question, answer, context)
-        score = eval_result.get("score", 0)
+        score = eval_result.get("score", 0.0)
 
         if score > best_score:
-            best_score, best_answer, best_context, best_docs = score, answer, context, docs
+            best_score = score
+            best_answer = answer
+            best_context = context
+            best_docs = docs
 
         if score > 0.8:
             break
