@@ -13,6 +13,7 @@ from langchain_community.llms import Ollama
 from langchain.prompts import PromptTemplate
 from langchain.retrievers import BM25Retriever, EnsembleRetriever
 from sentence_transformers import CrossEncoder
+from rag_engine_graph_optimized import build_graph_rag_fast, GRAPH_CONFIG
 
 try:
     from langchain_huggingface import HuggingFaceEmbeddings
@@ -47,8 +48,9 @@ _VIET_CHARS = "àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêề�
 _embedder = None
 _cross_encoder = None
 _llm_instance = None
-_llm_config_key = None   # track khi config thay đổi
-
+_llm_config_key = None
+# Alias để không phải đổi tên ở các chỗ khác
+build_graph_rag = build_graph_rag_fast
 
 def get_embedder() -> HuggingFaceEmbeddings:
     global _embedder
@@ -69,10 +71,7 @@ def get_cross_encoder() -> CrossEncoder:
 
 
 def _get_llm() -> Ollama:
-    """
-    FIX: Cache LLM instance — tránh tạo mới mỗi lần gọi.
-    Chỉ tạo lại khi config thay đổi (model / host / temperature).
-    """
+    """Chỉ tạo lại khi config thay đổi (model / host / temperature)."""
     global _llm_instance, _llm_config_key
     current_key = (CONFIG["llm_model"], CONFIG["ollama_host"], CONFIG["llm_temperature"])
     if _llm_instance is None or _llm_config_key != current_key:
@@ -91,18 +90,15 @@ def _get_llm() -> Ollama:
 
 def _clean_text(text: str) -> str:
     """
-    FIX QUAN TRỌNG: Làm sạch text trước khi đưa vào chunk/context.
-    - Xóa nhiều newline liên tiếp → 1 newline
+    Làm sạch text trước khi đưa vào chunk/context.
+    - Xóa ký tự control không in được
+    - Chuẩn hóa nhiều newline liên tiếp
     - Xóa khoảng trắng thừa
-    - Xóa các ký tự control không in được
+    - Xóa dòng chỉ có số trang
     """
-    # Xóa ký tự control (trừ newline và tab)
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
-    # Chuẩn hóa nhiều newline → tối đa 2
     text = re.sub(r'\n{3,}', '\n\n', text)
-    # Chuẩn hóa nhiều space liên tiếp → 1
     text = re.sub(r'[ \t]{2,}', ' ', text)
-    # Xóa dòng chỉ có số trang / header lặp lại (pattern: dòng có 1-4 ký tự)
     text = re.sub(r'(?m)^\s{0,2}\d{1,4}\s*$', '', text)
     return text.strip()
 
@@ -112,17 +108,15 @@ def process_pdf(file_path: str, embedder, chunk_size: int = None, chunk_overlap:
     loader = PDFPlumberLoader(file_path)
     docs = loader.load()
 
-    # FIX: Clean text mỗi document trước khi split
     for doc in docs:
         doc.page_content = _clean_text(doc.page_content)
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size or CONFIG["chunk_size"],
         chunk_overlap=chunk_overlap or CONFIG["chunk_overlap"],
-        separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""],  # separator tốt hơn
+        separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""],
     )
     chunks = splitter.split_documents(docs)
-    # Lọc bỏ chunks quá ngắn (< 50 ký tự) — thường là header/footer
     chunks = [c for c in chunks if len(c.page_content.strip()) >= 50]
     return chunks, len(docs), len(chunks)
 
@@ -166,12 +160,11 @@ def process_docx(file_path: str, embedder, chunk_size: int = None, chunk_overlap
 def build_hybrid_retriever(chunks, embedder):
     """
     Xây Hybrid Retriever (FAISS + BM25).
-    FIX: Trọng số 0.3 BM25 / 0.7 FAISS — semantic search quan trọng hơn
-    BM25 với tiếng Việt không tốt bằng dense retrieval nên giảm trọng số.
+    Trọng số 0.3 BM25 / 0.7 FAISS — semantic search quan trọng hơn.
     """
     vector_store = FAISS.from_documents(chunks, embedder)
     faiss_retriever = vector_store.as_retriever(
-        search_type="mmr",   # FIX: dùng MMR để tránh duplicate kết quả
+        search_type="mmr",
         search_kwargs={"k": CONFIG["retriever_k"], "fetch_k": CONFIG["retriever_k"] * 3},
     )
     bm25_retriever = BM25Retriever.from_documents(chunks)
@@ -179,7 +172,7 @@ def build_hybrid_retriever(chunks, embedder):
 
     hybrid_retriever = EnsembleRetriever(
         retrievers=[bm25_retriever, faiss_retriever],
-        weights=[0.3, 0.7],   # FIX: tăng weight cho semantic search
+        weights=[0.3, 0.7],
     )
     return hybrid_retriever
 
@@ -191,26 +184,42 @@ def build_hybrid_retriever(chunks, embedder):
 def _extract_entities_and_relations_llm(text: str, llm) -> list[dict]:
     """
     Dùng LLM để trích xuất entities và relationships.
-    FIX: Prompt rõ ràng hơn, giảm text xuống 500 chars để Qwen 7B trả lời nhanh hơn.
+
+    CẢI TIẾN:
+    - Tăng text từ 500 lên 800 chars để không bỏ sót thông tin quan trọng
+    - Phân loại relationship type rõ ràng (CAUSES, CONTAINS, REQUIRES, ...)
+    - Thêm rule chống entity generic cho tiếng Việt
+    - Thêm minimum 3 chars per entity
     """
-    prompt = f"""Extract key entities and their relationships from the text below.
-Return ONLY a JSON array, no explanation, no markdown, no preamble.
-Format: [{{"e1": "entity1", "rel": "relationship", "e2": "entity2"}}]
+    prompt = f"""Extract key entities and their relationships from the Vietnamese/English text below.
+Return ONLY a JSON array. No explanation, no markdown, no preamble.
+
+Format: [{{"e1": "entity1", "rel": "relationship_type:verb_phrase", "e2": "entity2"}}]
+
+Relationship types (use one prefix):
+- CAUSES: (e1 gây ra / dẫn đến e2)
+- CONTAINS: (e1 bao gồm / chứa e2)
+- REQUIRES: (e1 cần / phụ thuộc e2)
+- DEFINES: (e1 là định nghĩa / mô tả e2)
+- OPPOSES: (e1 mâu thuẫn / trái với e2)
+- IMPLEMENTS: (e1 thực hiện / áp dụng e2)
+
 Rules:
-- e1 and e2 must be specific concepts, tools, methods, or named things (NOT generic words like "system", "method", "data")
-- rel must be a short verb phrase (2-5 words) describing how e1 relates to e2
-- Extract 3 to 6 relationships maximum
-- Keep entities in the same language as the text
+- e1 and e2 must be SPECIFIC named concepts, tools, methods, organizations, regulations, or processes
+- FORBIDDEN generic words: "hệ thống", "phương pháp", "dữ liệu", "thông tin", "quy trình",
+  "system", "method", "data", "information", "process", "thing", "item", "value"
+- Minimum 3 characters per entity name
+- Extract 3 to 8 relationships maximum
+- Keep entities in their ORIGINAL language from the text (do not translate)
 
 Text:
-{text[:500]}
+{text[:800]}
 
 JSON array only:"""
+
     try:
         raw = llm.invoke(prompt).strip()
-        # Bỏ markdown fence
         raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
-        # Tìm JSON array trong response nếu có text thừa
         match = re.search(r'\[.*\]', raw, re.DOTALL)
         if match:
             raw = match.group()
@@ -222,7 +231,7 @@ JSON array only:"""
             and r["e1"].strip() and r["e2"].strip()
             and len(r["e1"]) > 2 and len(r["e2"]) > 2
         ]
-        return valid[:6]
+        return valid[:8]
     except Exception:
         # Fallback: extract acronym + Title Case
         entities = list(set(
@@ -232,15 +241,12 @@ JSON array only:"""
         relations = []
         for i in range(len(entities)):
             for j in range(i + 1, len(entities)):
-                relations.append({"e1": entities[i], "rel": "related_to", "e2": entities[j]})
+                relations.append({"e1": entities[i], "rel": "DEFINES:related_to", "e2": entities[j]})
         return relations[:6]
 
 
-def build_graph_rag(chunks: list) -> nx.Graph:
-    """
-    Xây Knowledge Graph từ chunks bằng LLM-based entity extraction.
-    Kiến trúc chuẩn Graph RAG (Microsoft 2024).
-    """
+def _build_graph_rag_legacy(chunks: list) -> nx.Graph:
+    """Xây Knowledge Graph từ chunks bằng LLM-based entity extraction."""
     llm = _get_llm()
     embedder = get_embedder()
     G = nx.Graph()
@@ -423,23 +429,39 @@ def _detect_language(text: str) -> str:
 
 def _build_prompt(language: str) -> PromptTemplate:
     """
-    FIX CHÍNH: Prompt được cải thiện triệt để.
-    - Yêu cầu độ dài tối thiểu (không được trả lời 1-2 câu ngắn)
-    - Yêu cầu format có cấu trúc rõ ràng
-    - Hướng dẫn rõ cách xử lý từng tình huống
-    - Chain-of-thought nhẹ: "Phân tích ngữ cảnh trước, sau đó trả lời"
+    PROMPT CHÍNH — Classic RAG.
+
+    - Thêm chain-of-thought 2 bước: đọc/phân tích → trả lời
+    - Yêu cầu trích dẫn số trang cụ thể để tăng độ tin cậy
+    - Xử lý rõ trường hợp nhiều chunk mâu thuẫn nhau
+    - Định dạng output theo từng loại câu hỏi (điểm đơn / nhiều điểm / so sánh)
+    - Cấm bịa đặt số liệu, tên người, ngày tháng
+    - KHÔNG yêu cầu độ dài cứng nhắc — thay bằng hướng dẫn theo ngữ cảnh
     """
     if language == "vi":
-        template = """Bạn là chuyên gia phân tích tài liệu. Hãy đọc kỹ NGỮ CẢNH và trả lời CÂU HỎI một cách CHÍNH XÁC, ĐẦY ĐỦ, CÓ CẤU TRÚC.
+        template = """Bạn là chuyên gia phân tích tài liệu nội bộ. Nhiệm vụ của bạn là trả lời câu hỏi CHỈ dựa trên các đoạn trích được cung cấp.
 
+═══ BƯỚC 1 — ĐỌC VÀ PHÂN TÍCH NGỮ CẢNH ═══
+Trước khi trả lời, hãy xác định nội tâm:
+• Đoạn nào chứa thông tin trực tiếp trả lời câu hỏi?
+• Đoạn nào cung cấp bối cảnh bổ sung?
+• Có mâu thuẫn giữa các đoạn không? Nếu có, ưu tiên đoạn chi tiết hơn hoặc xuất hiện sau.
+
+═══ BƯỚC 2 — TRẢ LỜI ═══
 NGUYÊN TẮC BẮT BUỘC:
-1. CHỈ dùng thông tin có trong [NGỮ CẢNH]. Tuyệt đối không thêm kiến thức ngoài.
-2. Trả lời bằng TIẾNG VIỆT, tối thiểu 3-5 câu đầy đủ, có cấu trúc rõ ràng.
-3. Nếu ngữ cảnh đủ thông tin → trả lời đầy đủ, dùng gạch đầu dòng hoặc đánh số khi liệt kê.
-4. Nếu ngữ cảnh có một phần → trả lời phần có, ghi rõ: "Tài liệu không đề cập đến [phần thiếu]."
-5. Nếu ngữ cảnh không liên quan → trả lời: "Tài liệu không đề cập đến vấn đề này."
-6. Với câu hỏi follow-up → kết hợp [HỘI THOẠI TRƯỚC] và [NGỮ CẢNH] để trả lời liền mạch.
-7. KHÔNG lặp lại câu hỏi trong câu trả lời. KHÔNG viết "Dựa vào ngữ cảnh..." ở đầu.
+1. CHỈ dùng thông tin trong [NGỮ CẢNH]. Tuyệt đối không thêm kiến thức bên ngoài.
+2. Khi trích dẫn thông tin quan trọng, ghi rõ nguồn: (Trang X) hoặc (Đoạn Y).
+3. Nếu nhiều đoạn đề cập cùng một vấn đề → tổng hợp, không lặp lại.
+4. Nếu ngữ cảnh có một phần thông tin → trả lời phần có, ghi rõ: "Tài liệu không đề cập đến [phần thiếu]."
+5. Nếu ngữ cảnh hoàn toàn không liên quan → trả lời: "Tài liệu không đề cập đến vấn đề này."
+6. Với câu hỏi follow-up → kết hợp [HỘI THOẠI TRƯỚC] và [NGỮ CẢNH] để giữ ngữ mạch liên tục.
+7. KHÔNG bịa đặt số liệu, tên người, ngày tháng, hoặc bất kỳ dữ kiện nào không có trong tài liệu.
+8. KHÔNG bắt đầu bằng "Dựa vào ngữ cảnh..." hay lặp lại câu hỏi.
+
+ĐỊNH DẠNG TRẢ LỜI:
+• Câu hỏi có 1 điểm chính → đoạn văn trả lời trực tiếp, súc tích.
+• Câu hỏi có nhiều điểm → dùng gạch đầu dòng hoặc đánh số, mỗi điểm 1-2 câu.
+• Câu hỏi so sánh → 2 đoạn đối chiếu hoặc bảng rõ ràng.
 
 [HỘI THOẠI TRƯỚC]
 {chat_history}
@@ -450,18 +472,32 @@ NGUYÊN TẮC BẮT BUỘC:
 [CÂU HỎI]
 {question}
 
-[TRẢ LỜI]"""
-    else:
-        template = """You are a document analysis expert. Read the CONTEXT carefully and answer the QUESTION accurately, completely, and with clear structure.
+[TRẢ LỜI — Phân tích từ ngữ cảnh, trích dẫn trang khi có thể]"""
 
+    else:
+        template = """You are an internal document analysis expert. Your task is to answer the question using ONLY the provided excerpts.
+
+═══ STEP 1 — READ AND ANALYZE THE CONTEXT ═══
+Before answering, mentally identify:
+• Which passage directly answers the question?
+• Which passages provide supporting context?
+• Are there contradictions between passages? If so, prioritize the more detailed or later-appearing one.
+
+═══ STEP 2 — ANSWER ═══
 MANDATORY RULES:
-1. ONLY use information present in [CONTEXT]. Never add outside knowledge.
-2. Answer in ENGLISH with minimum 3-5 complete sentences, well-structured.
-3. If context has enough info → answer fully, use bullet points or numbering for lists.
+1. ONLY use information in [CONTEXT]. Never add outside knowledge.
+2. When citing important information, reference the source: (Page X) or (Passage Y).
+3. If multiple passages cover the same topic → synthesize, do not repeat.
 4. If context has partial info → answer what you can, clearly state: "The document does not mention [missing part]."
-5. If context has no relevant info → respond: "The document does not mention this topic."
-6. For follow-up questions → combine [HISTORY] and [CONTEXT] for a coherent answer.
-7. DO NOT repeat the question. DO NOT start with "Based on the context...".
+5. If context is completely unrelated → respond: "The document does not mention this topic."
+6. For follow-up questions → combine [HISTORY] and [CONTEXT] for a coherent, continuous answer.
+7. NEVER fabricate figures, names, dates, or any fact not present in the document.
+8. DO NOT start with "Based on the context..." or repeat the question.
+
+RESPONSE FORMAT:
+• Single-point question → direct prose answer, concise.
+• Multi-point question → bullet points or numbered list, 1-2 sentences each.
+• Comparison question → two contrasting paragraphs or a clear table.
 
 [HISTORY]
 {chat_history}
@@ -472,68 +508,89 @@ MANDATORY RULES:
 [QUESTION]
 {question}
 
-[ANSWER]"""
+[ANSWER — Analyze from context, cite page numbers where possible]"""
 
     return PromptTemplate(template=template, input_variables=["context", "question", "chat_history"])
 
 
 def _build_graph_prompt(language: str) -> PromptTemplate:
     """
-    Prompt riêng cho Graph RAG — nhấn mạnh khai thác quan hệ giữa các thực thể.
-    FIX: Thêm yêu cầu rõ về độ dài và format.
+    PROMPT GRAPH RAG.
+
+    CẢI TIẾN SO VỚI PHIÊN BẢN CŨ:
+    - Giải thích rõ cho model biết đặc điểm của Graph RAG retrieval
+      (chunks được chọn qua mạng quan hệ thực thể, không phải chỉ similarity)
+    - Hướng dẫn 4 bước phân tích tường minh: xác định → tìm → truy vết → tổng hợp
+    - Yêu cầu ghi nguồn (trang) khi trích dẫn
+    - Xử lý rõ trường hợp mâu thuẫn giữa các đoạn
     """
     if language == "vi":
-        template = """Bạn là chuyên gia phân tích tài liệu sử dụng Graph RAG. Các đoạn văn dưới đây được chọn dựa trên MỐI QUAN HỆ giữa các thực thể trong tài liệu.
+        template = """Bạn là chuyên gia phân tích tài liệu sử dụng Graph RAG. Các đoạn dưới đây được chọn dựa trên MẠNG LƯỚI QUAN HỆ giữa các thực thể — nghĩa là chúng được liên kết với nhau qua các khái niệm, không chỉ đơn thuần gần về nghĩa.
 
-NHIỆM VỤ: Trả lời câu hỏi, đặc biệt chú ý:
-- Mô tả MỐI LIÊN HỆ và SỰ KẾT NỐI giữa các khái niệm/thực thể
-- Giải thích TẠI SAO các thực thể liên quan đến nhau
-- So sánh, đối chiếu nếu có nhiều thực thể cùng loại
-- Tổng hợp thông tin từ NHIỀU đoạn khác nhau
+═══ ĐẶC ĐIỂM CỦA NGỮ CẢNH NÀY ═══
+Bạn nhận được {num_chunks} đoạn văn được kết nối qua đồ thị tri thức. Các đoạn này:
+• Có thể đến từ nhiều phần khác nhau trong tài liệu
+• Được chọn vì chứa các thực thể LIÊN QUAN đến câu hỏi qua mối quan hệ trực tiếp hoặc gián tiếp
+• Cùng nhau tạo thành bức tranh đầy đủ hơn bất kỳ đoạn nào riêng lẻ
+
+═══ NHIỆM VỤ 4 BƯỚC ═══
+1. XÁC ĐỊNH các thực thể/khái niệm chính trong câu hỏi.
+2. TÌM các thực thể đó trong các đoạn văn được cung cấp.
+3. TRUY VẾT mối quan hệ: A dẫn đến B, A phụ thuộc vào C, B mâu thuẫn với D.
+4. TỔNG HỢP thông tin từ nhiều đoạn — ưu tiên phân tích SỰ KẾT NỐI hơn liệt kê đơn thuần.
 
 NGUYÊN TẮC BẮT BUỘC:
-1. CHỈ dùng thông tin trong [NGỮ CẢNH]. Không thêm kiến thức ngoài.
-2. Trả lời bằng TIẾNG VIỆT, ĐẦY ĐỦ và CÓ CẤU TRÚC (gạch đầu dòng hoặc đánh số khi cần).
-3. Tối thiểu 4-6 câu, phân tích sâu các mối quan hệ.
-4. Nếu không có thông tin liên quan: "Tài liệu không đề cập đến vấn đề này."
-5. KHÔNG viết "Dựa vào ngữ cảnh..." hay lặp lại câu hỏi.
+1. CHỈ dùng thông tin trong [NGỮ CẢNH]. Không thêm kiến thức bên ngoài.
+2. Khi trích dẫn thông tin quan trọng, ghi rõ nguồn: (Trang X) hoặc (Đoạn Y).
+3. Nếu các đoạn mâu thuẫn → ghi nhận cả hai quan điểm và giải thích sự khác biệt.
+4. Nếu không có thông tin liên quan → trả lời: "Tài liệu không đề cập đến vấn đề này."
+5. KHÔNG bắt đầu bằng "Dựa vào ngữ cảnh..." hay lặp lại câu hỏi.
+6. KHÔNG bịa đặt số liệu, tên người, ngày tháng không có trong tài liệu.
 
 [HỘI THOẠI TRƯỚC]
 {chat_history}
 
-[NGỮ CẢNH — {num_chunks} đoạn liên quan]
+[NGỮ CẢNH — {num_chunks} đoạn liên kết qua đồ thị quan hệ]
 {context}
 
 [CÂU HỎI]
 {question}
 
-[TRẢ LỜI — Phân tích đầy đủ, có cấu trúc]"""
-    else:
-        template = """You are a document analysis expert using Graph RAG. The passages below were selected based on RELATIONSHIPS between entities in the document.
+[TRẢ LỜI — Phân tích quan hệ thực thể, tổng hợp từ nhiều đoạn, ghi nguồn khi cần]"""
 
-TASK: Answer the question with special focus on:
-- Describing RELATIONSHIPS and CONNECTIONS between concepts/entities
-- Explaining WHY entities are related to each other
-- Comparing and contrasting similar entities
-- Synthesizing information ACROSS multiple passages
+    else:
+        template = """You are a document analysis expert using Graph RAG. The passages below were selected based on the RELATIONSHIP NETWORK between entities — meaning they are connected through shared concepts, not just semantic similarity alone.
+
+═══ CHARACTERISTICS OF THIS CONTEXT ═══
+You receive {num_chunks} passages connected via a knowledge graph. These passages:
+• May come from different sections of the document
+• Were selected because they contain entities RELATED to the question through direct or indirect relationships
+• Together form a more complete picture than any single passage alone
+
+═══ 4-STEP TASK ═══
+1. IDENTIFY the key entities/concepts in the question.
+2. LOCATE those entities in the provided passages.
+3. TRACE the relationships: A leads to B, A depends on C, B contradicts D.
+4. SYNTHESIZE information across passages — prioritize analyzing CONNECTIONS over simple listing.
 
 MANDATORY RULES:
 1. ONLY use information in [CONTEXT]. No outside knowledge.
-2. Answer in ENGLISH, fully and with CLEAR STRUCTURE (use bullets or numbering for lists).
-3. Minimum 4-6 sentences with deep relationship analysis.
-4. If no relevant info: "The document does not mention this topic."
-5. DO NOT write "Based on the context..." or repeat the question.
+2. When citing important information, reference the source: (Page X) or (Passage Y).
+3. If passages contradict each other → acknowledge both views and explain the difference.
+4. If no relevant info found → respond: "The document does not mention this topic."
+5. DO NOT start with "Based on the context..." or repeat the question.
+6. NEVER fabricate figures, names, or dates not present in the document.
 
 [HISTORY]
 {chat_history}
 
-[CONTEXT — {num_chunks} relevant passages]
+[CONTEXT — {num_chunks} passages linked via relationship graph]
 {context}
 
 [QUESTION]
 {question}
 
-[ANSWER — Full structured analysis]"""
+[ANSWER — Analyze entity relationships, synthesize across passages, cite sources when needed]"""
 
     return PromptTemplate(
         template=template,
@@ -541,18 +598,22 @@ MANDATORY RULES:
     )
 
 
-def _format_chat_history(chat_history: list, max_turns: int = 3) -> str:
+def _format_chat_history(chat_history: list, max_turns: int = 4) -> str:
     """
-    FIX QUAN TRỌNG:
-    - Chỉ lấy max_turns câu gần nhất
-    - Truncate answer dài (tối đa 200 ký tự) để tránh ăn context window
-    - Skip các compare-mode answer (quá dài và nhiễu)
+    Format lịch sử hội thoại để đưa vào prompt.
+
+    CẢI TIẾN SO VỚI PHIÊN BẢN CŨ:
+    - Tăng max_turns từ 3 lên 4 để có thêm ngữ cảnh hội thoại
+    - Tăng answer_truncate từ 200 lên 350 chars — tránh mất ngữ cảnh câu trả lời dài
+    - Dùng role label [Người dùng]/[Trợ lý] rõ ràng hơn User:/Assistant:
+      giúp model phân biệt role tốt hơn trong tiếng Việt
     """
     if not chat_history:
         return "Không có lịch sử hội thoại."
 
     history_text = []
     recent = chat_history[-max_turns:]
+    answer_truncate = 350
 
     for item in recent:
         q = item.get("question", "").strip()
@@ -560,24 +621,24 @@ def _format_chat_history(chat_history: list, max_turns: int = 3) -> str:
         if not q:
             continue
 
-        # Skip compare-mode answers (chứa "**Classic RAG:**")
+        # Skip compare-mode answers (chứa marker đặc biệt)
         if "**Classic RAG:**" in a or "**Graph RAG:**" in a:
             continue
 
-        # Truncate answer dài
-        if len(a) > 200:
-            a = a[:200].rsplit(" ", 1)[0] + "..."
+        # Truncate answer dài nhưng giữ nhiều hơn để bảo toàn ngữ cảnh
+        if len(a) > answer_truncate:
+            a = a[:answer_truncate].rsplit(" ", 1)[0] + "..."
 
-        history_text.append(f"User: {q}")
-        history_text.append(f"Assistant: {a}")
+        history_text.append(f"[Người dùng]: {q}")
+        history_text.append(f"[Trợ lý]: {a}")
 
     return "\n".join(history_text) if history_text else "Không có lịch sử hội thoại."
 
 
 def _build_context(source_docs) -> str:
     """
-    FIX: Build context có đánh số đoạn văn rõ ràng.
-    Giúp LLM dễ tham chiếu hơn khi trả lời.
+    Build context có đánh số đoạn văn rõ ràng.
+    Giúp LLM dễ tham chiếu khi trả lời (Đoạn 1, Trang X...).
     """
     parts = []
     for i, doc in enumerate(source_docs, 1):
@@ -657,7 +718,6 @@ def ask_question_stream_with_sources(
         yield "@@SOURCES@@" + json.dumps([], ensure_ascii=False)
         return
 
-    # FIX: Dùng _build_context để có header đánh số
     context = _build_context(source_docs)
 
     filled_prompt = prompt.format(
@@ -666,19 +726,15 @@ def ask_question_stream_with_sources(
         chat_history=history_text,
     )
 
-    # FIX CRITICAL: Stream đúng cách
-    # Ollama.stream() yield từng token string, KHÔNG phải character
     llm = _get_llm()
     try:
         for token in llm.stream(filled_prompt):
-            # token là string, yield trực tiếp
             if token:
                 yield token
     except Exception as e:
         yield f"\n\n[Lỗi khi gọi model: {e}]"
         return
 
-    # Trả sources
     sources = [
         {
             "index": i + 1,
@@ -750,10 +806,7 @@ def ask_compare_rag(
     graph: nx.Graph,
     chat_history: list = None,
 ) -> Generator[str, None, None]:
-    """
-    FIX: Stream đúng cách — llm.stream() yield token strings.
-    Dùng _build_context để context có cấu trúc rõ ràng.
-    """
+    """Stream song song Classic RAG và Graph RAG để so sánh."""
     lang = _detect_language(question)
     history_text = _format_chat_history(chat_history or [])
     llm = _get_llm()
@@ -779,7 +832,6 @@ def ask_compare_rag(
         chat_history=history_text,
     )
 
-    # FIX: stream đúng — yield token trực tiếp
     for token in llm.stream(filled_classic):
         if token:
             yield token
@@ -841,31 +893,73 @@ def ask_compare_rag(
 # ══════════════════════════════════════════════════════════════
 
 def rewrite_query(question: str, chat_history: str = "") -> str:
-    """FIX: Prompt ngắn gọn hơn, tránh LLM thêm thừa."""
+    """
+    Viết lại câu hỏi để tăng khả năng tìm kiếm trong hệ thống RAG.
+
+    CẢI TIẾN SO VỚI PHIÊN BẢN CŨ:
+    - Cung cấp 5 chiến lược rewrite tường minh thay vì chỉ nói "more specific"
+    - Thêm hướng dẫn giữ nguyên ngôn ngữ gốc (tiếng Việt vẫn là tiếng Việt)
+    - Thêm rule: nếu câu hỏi đã đủ cụ thể → giữ nguyên, không rewrite thừa
+    - Thêm hướng dẫn expand abbreviations và thêm loại thực thể nếu bị ngầm hiểu
+    """
     llm = _get_llm()
-    history_part = f"\nChat History:\n{chat_history}\n" if chat_history.strip() and chat_history != "Không có lịch sử hội thoại." else ""
-    prompt = f"""Rewrite the following question to be more specific and retrieval-friendly for a document search system. Output ONLY the rewritten question, nothing else.{history_part}
-Original: {question}
-Rewritten:"""
+    history_part = (
+        f"\nLịch sử hội thoại gần nhất:\n{chat_history}\n"
+        if chat_history.strip() and chat_history != "Không có lịch sử hội thoại."
+        else ""
+    )
+    prompt = f"""Bạn là trình tối ưu hóa truy vấn cho hệ thống tìm kiếm tài liệu (RAG).
+Nhiệm vụ: Viết lại câu hỏi để tăng tối đa khả năng tìm đúng đoạn văn trong cơ sở dữ liệu tài liệu.
+
+Chiến lược viết lại (áp dụng cái phù hợp nhất):
+1. MỞ RỘNG từ viết tắt hoặc ký hiệu ngắn gọn
+2. THÊM loại thực thể nếu bị ngầm hiểu (vd: "điều khoản" → "điều khoản hợp đồng lao động")
+3. TÁCH câu hỏi phức hợp thành câu hỏi con có thể tìm kiếm nhất
+4. THAY THẾ đại từ (nó, họ, điều này...) bằng tên cụ thể từ lịch sử hội thoại
+5. GIỮ NGUYÊN ngôn ngữ gốc (tiếng Việt vẫn là tiếng Việt, không dịch sang tiếng Anh)
+
+Nếu câu hỏi đã đủ cụ thể và rõ ràng → xuất nguyên văn, không thay đổi.
+Chỉ xuất câu hỏi đã viết lại. Không giải thích, không thêm tiền tố, không dùng dấu ngoặc kép.{history_part}
+
+Câu hỏi gốc: {question}
+Câu hỏi đã viết lại:"""
+
     result = llm.invoke(prompt).strip()
-    # Nếu LLM trả lời quá dài (nhiều dòng), chỉ lấy dòng đầu
+    # Nếu LLM trả lời nhiều dòng, chỉ lấy dòng đầu
     return result.split("\n")[0].strip() or question
 
 
 def evaluate_answer(question: str, answer: str, context: str) -> dict:
-    """FIX: Dùng _get_llm() thay vì tạo Ollama mới, tiết kiệm overhead."""
-    llm = _get_llm()
-    # Truncate để tránh prompt quá dài
-    ctx_short = context[:600] if len(context) > 600 else context
-    ans_short = answer[:300] if len(answer) > 300 else answer
-    prompt = f"""Score how well the answer addresses the question based on the context.
-Return ONLY JSON: {{"score": <0.0-1.0>, "reason": "<brief reason>"}}
+    """
+    Đánh giá chất lượng câu trả lời cho vòng lặp Self-RAG.
 
-Question: {question}
-Context: {ctx_short}
-Answer: {ans_short}
+    CẢI TIẾN SO VỚI PHIÊN BẢN CŨ:
+    - Thêm rubric chấm điểm 5 mức rõ ràng (0.9-1.0, 0.7-0.8, 0.5-0.6, 0.3-0.4, 0.0-0.2)
+    - Thêm field "missing" để biết thông tin còn thiếu → giúp rewrite tốt hơn
+    - Tăng ctx_short từ 600 lên 800 chars để context đủ cho model đánh giá
+    - Tăng ans_short từ 300 lên 400 chars
+    """
+    llm = _get_llm()
+    ctx_short = context[:800] if len(context) > 800 else context
+    ans_short = answer[:400] if len(answer) > 400 else answer
+
+    prompt = f"""Đánh giá chất lượng câu trả lời dựa trên câu hỏi và ngữ cảnh.
+
+Rubric chấm điểm:
+- 0.9-1.0: Câu trả lời đầy đủ, chính xác, trả lời trực tiếp câu hỏi, mọi thông tin đều có trong ngữ cảnh
+- 0.7-0.8: Câu trả lời phần lớn đúng, thiếu sót nhỏ, được hỗ trợ tốt bởi ngữ cảnh
+- 0.5-0.6: Câu trả lời chỉ trả lời một phần, có thông tin không được ngữ cảnh xác nhận, hoặc bỏ sót điểm chính
+- 0.3-0.4: Câu trả lời mơ hồ, phần lớn không liên quan, hoặc mâu thuẫn với ngữ cảnh
+- 0.0-0.2: Câu trả lời sai, bịa đặt, hoặc hoàn toàn lạc đề
+
+Chỉ trả về JSON: {{"score": <0.0-1.0>, "missing": "<thông tin còn thiếu trong câu trả lời, nếu có>", "reason": "<1 câu giải thích>"}}
+
+Câu hỏi: {question}
+Ngữ cảnh (trích đoạn): {ctx_short}
+Câu trả lời: {ans_short}
 
 JSON:"""
+
     result = llm.invoke(prompt).strip()
     try:
         match = re.search(r'\{.*\}', result, re.DOTALL)
@@ -873,19 +967,27 @@ JSON:"""
             return json.loads(match.group())
         return json.loads(result)
     except Exception:
-        return {"score": 0.5, "reason": "parse_error"}
+        return {"score": 0.5, "missing": "", "reason": "parse_error"}
 
 
 def self_rag_pipeline(question, retriever, chat_history=None):
+    """
+    Self-RAG: tự đánh giá và cải thiện câu trả lời qua nhiều vòng lặp.
+
+    Vòng 1: dùng câu hỏi gốc
+    Vòng 2+: rewrite query dựa trên thông tin "missing" từ evaluate_answer
+    """
     history_text = _format_chat_history(chat_history or [])
     best_answer, best_score, best_context, best_docs = "", 0.0, "", []
 
     for iteration in range(CONFIG["self_rag_max_iter"]):
-        # Rewrite query chỉ từ lần 2 trở đi
+        # Vòng 1: dùng câu hỏi gốc; vòng 2+: rewrite dựa trên missing info
         if iteration == 0:
             search_query = question
         else:
-            search_query = rewrite_query(question, history_text)
+            # Truyền thêm thông tin "missing" vào lịch sử để rewrite thông minh hơn
+            missing_hint = f"\n(Lưu ý: câu trả lời trước còn thiếu: {best_eval.get('missing', '')})" if best_eval.get("missing") else ""
+            search_query = rewrite_query(question + missing_hint, history_text)
 
         docs = retriever.invoke(search_query)[:10]
 
@@ -900,8 +1002,8 @@ def self_rag_pipeline(question, retriever, chat_history=None):
 
         llm = _get_llm()
         answer = llm.invoke(filled)
-        eval_result = evaluate_answer(question, answer, context)
-        score = eval_result.get("score", 0.0)
+        best_eval = evaluate_answer(question, answer, context)
+        score = best_eval.get("score", 0.0)
 
         if score > best_score:
             best_score = score

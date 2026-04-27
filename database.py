@@ -1,11 +1,7 @@
-# Tất cả SQLite logic (câu 2, 3)
+# Tất cả SQLite logic
 # ══════════════════════════════════════════════════════════════
 # database.py
 # Chịu trách nhiệm: Tất cả thao tác SQLite (lưu, đọc, xóa lịch sử)
-#
-# Để mở rộng (Câu 2, 3 trong mục 8):
-#   - Thêm cột mới vào bảng conversations ở hàm init_db()
-#   - Thêm hàm mới vào file này, rồi import vào app.py
 # ══════════════════════════════════════════════════════════════
 
 import sqlite3

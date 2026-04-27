@@ -15,6 +15,7 @@ from rag_engine import (
     ask_question_stream_with_sources,
     ask_compare_rag, build_graph_rag,
 )
+from rag_engine_graph_optimized import streamlit_build_graph_with_progress
 from styles import APP_CSS
 
 # ══════════════════════════════════════════════════════════════
@@ -144,30 +145,216 @@ def _dialog_delete_pdf():
 # RENDER HELPERS
 # ══════════════════════════════════════════════════════════════
 
-def _highlight_text(content: str, question: str) -> str:
+def _highlight_text(content: str, question: str, answer: str = "") -> str:
+    """
+    Highlight đoạn văn là NGUỒN THỰC SỰ của câu trả lời.
+
+    THUẬT TOÁN: N-gram Source Tracing
+    ─────────────────────────────────────────────────────────
+    Ý tưởng cốt lõi: LLM paraphrase nội dung từ chunk → câu trong answer
+    và câu trong chunk sẽ chia sẻ nhiều CỤM TỪ (bigram/trigram) giống nhau,
+    dù không giống từng từ.
+
+    Vì sao tốt hơn bag-of-words:
+    - BOW: "Hồ Chí Minh" xuất hiện ở MỌI câu → mọi câu đều score cao
+    - N-gram: "gia đình nhà nho yêu nước" chỉ xuất hiện ở đúng đoạn nguồn
+
+    Pipeline:
+    1. Tách câu trong chunk thành danh sách câu hoàn chỉnh (≥ 40 ký tự)
+    2. Tách câu trong answer thành danh sách câu
+    3. Với mỗi câu trong chunk, tính Jaccard similarity của bigrams với
+       từng câu trong answer → lấy max
+    4. Chỉ highlight nếu score ≥ ngưỡng động (tránh false positive)
+    5. Span-based rendering (không dùng set lookup)
+    ─────────────────────────────────────────────────────────
+    """
     import re
+
+    def escape(text: str) -> str:
+        return (text.replace("&", "&amp;")
+                    .replace("<", "&lt;")
+                    .replace(">", "&gt;"))
+
+    # ── Bước 1: Tách câu trong chunk ─────────────────────────────────────────
+    # Chuẩn hóa: single newline → space (PDF wrap), giữ paragraph break
+    normalized = re.sub(r'(?<!\n)\n(?!\n)', ' ', content)
+    normalized = re.sub(r' {2,}', ' ', normalized)
+
+    # Tách theo dấu câu tiếng Việt, paragraph break
+    # Lookbehind: sau . ! ? …  — Lookahead: chữ hoa hoặc số hoặc bullet
+    SENT_SPLIT = re.compile(
+        r'(?<=[.!?…])\s+'
+        r'(?=[A-ZÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚĂĐĨŨƠƯẠẢẤẦẨẪẬẮẰẲẴẶẸẺẼẾỀỂỄỆỈỊỌỎỐỒỔỖỘỚỜỞỠỢỤỦỨỪỬỮỰỲỴỶỸ0-9\-])'
+        r'|\n\n+'
+    )
+    raw_sents = SENT_SPLIT.split(normalized)
+    # Chỉ giữ câu đủ dài — lọc header/số trang/fragment
+    chunk_sents = [s.strip() for s in raw_sents if len(s.strip()) >= 40]
+
+    if not chunk_sents:
+        return escape(content)
+
+    # ── Bước 2: Tách câu trong answer ────────────────────────────────────────
+    answer_sents = []
+    if answer and len(answer.strip()) >= 20:
+        ans_normalized = re.sub(r'(?<!\n)\n(?!\n)', ' ', answer)
+        ans_raw = SENT_SPLIT.split(ans_normalized)
+        answer_sents = [s.strip() for s in ans_raw if len(s.strip()) >= 20]
+
+    # Nếu không có answer, fallback về question
+    if not answer_sents and question:
+        answer_sents = [question]
+
+    if not answer_sents:
+        return escape(content)
+
+    # ── Bước 3: Bigram Jaccard similarity ────────────────────────────────────
     STOP_WORDS = {
         "là", "của", "và", "các", "có", "cho", "trong", "với", "về", "được",
-        "này", "đó", "khi", "nào", "như", "hay", "hoặc", "mô", "hình", "tôi",
-        "bạn", "hãy", "trình", "bày", "the", "of", "and", "for", "in", "is",
-        "to", "a", "an", "it", "on", "at", "by", "or", "be",
+        "này", "đó", "khi", "nào", "như", "hay", "hoặc", "tôi", "bạn",
+        "hãy", "theo", "đã", "một", "những", "từ", "sau", "tại", "đến",
+        "không", "bởi", "vì", "nên", "mà", "lên", "ra", "vào", "đi",
+        "the", "of", "and", "for", "in", "is", "to", "a", "an",
+        "it", "on", "at", "by", "or", "be", "that", "this", "are", "was",
     }
-    raw_tokens = re.findall(r'\w+', question, re.UNICODE)
-    keywords = [t for t in raw_tokens if len(t) > 2 and t.lower() not in STOP_WORDS]
-    if not keywords:
-        return content
-    safe = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    for kw in keywords:
-        pattern = re.compile(re.escape(kw), re.IGNORECASE | re.UNICODE)
-        safe = pattern.sub(
-            lambda m: f"<mark style='background:#FFD700;padding:1px 3px;"
-                      f"border-radius:3px;font-weight:600'>{m.group()}</mark>",
-            safe,
+
+    def tokenize(text: str) -> list:
+        tokens = re.findall(r'[\w\u00C0-\u024F\u1E00-\u1EFF]+', text.lower())
+        return [t for t in tokens if len(t) >= 2 and t not in STOP_WORDS]
+
+    def get_bigrams(tokens: list) -> set:
+        if len(tokens) < 2:
+            return set(tokens)  # fallback: unigrams nếu quá ngắn
+        return {(tokens[i], tokens[i+1]) for i in range(len(tokens) - 1)}
+
+    def get_trigrams(tokens: list) -> set:
+        if len(tokens) < 3:
+            return set()
+        return {(tokens[i], tokens[i+1], tokens[i+2]) for i in range(len(tokens) - 2)}
+
+    def jaccard(set_a: set, set_b: set) -> float:
+        if not set_a or not set_b:
+            return 0.0
+        inter = len(set_a & set_b)
+        union = len(set_a | set_b)
+        return inter / union if union > 0 else 0.0
+
+    def score_chunk_sent(chunk_sent: str) -> float:
+        """
+        Score = max Jaccard(bigrams_chunk_sent, bigrams_answer_sent)
+        Dùng cả bigram + trigram, trigram có trọng số cao hơn vì đặc trưng hơn.
+        """
+        c_tokens = tokenize(chunk_sent)
+        c_bigrams = get_bigrams(c_tokens)
+        c_trigrams = get_trigrams(c_tokens)
+
+        best = 0.0
+        for a_sent in answer_sents:
+            a_tokens = tokenize(a_sent)
+            a_bigrams = get_bigrams(a_tokens)
+            a_trigrams = get_trigrams(a_tokens)
+
+            bi_score = jaccard(c_bigrams, a_bigrams)
+            tri_score = jaccard(c_trigrams, a_trigrams) if c_trigrams and a_trigrams else 0.0
+
+            # Trigram đặc trưng hơn → weight cao hơn
+            combined = 0.4 * bi_score + 0.6 * tri_score if tri_score > 0 else bi_score
+            best = max(best, combined)
+        return best
+
+    scored_sents = [(score_chunk_sent(s), s) for s in chunk_sents]
+    scored_sents.sort(key=lambda x: x[0], reverse=True)
+
+    # ── Bước 4: Ngưỡng động ──────────────────────────────────────────────────
+    if not scored_sents:
+        return escape(content)
+
+    max_score = scored_sents[0][0]
+
+    # Không highlight gì nếu score tốt nhất quá thấp
+    # (nghĩa là không có câu nào thực sự là nguồn của answer)
+    ABS_MIN = 0.05          # ngưỡng tuyệt đối tối thiểu
+    REL_MIN_RATIO = 0.5     # câu được chọn phải ≥ 50% score của câu tốt nhất
+
+    if max_score < ABS_MIN:
+        return escape(content)
+
+    dynamic_threshold = max(ABS_MIN, max_score * REL_MIN_RATIO)
+
+    highlight_sents = []
+    for sc, sent in scored_sents:
+        if sc < dynamic_threshold:
+            break
+        if len(highlight_sents) >= 2:   # tối đa 2 câu highlight / chunk
+            break
+        highlight_sents.append(sent)
+
+    if not highlight_sents:
+        return escape(content)
+
+    # ── Bước 5: Span-based rendering ─────────────────────────────────────────
+    # Tìm vị trí (start, end) của từng câu cần highlight trong content GỐC
+    exact_spans = []
+    for sent in highlight_sents:
+        # Thử match 25 ký tự đầu của câu trong content gốc
+        probe_len = min(25, len(sent))
+        probe = sent[:probe_len].strip()
+        # Bỏ ký tự đặc biệt regex trong probe
+        probe_escaped = re.escape(probe)
+        # Tìm trong content gốc
+        m = re.search(probe_escaped, content)
+        if not m:
+            # Thử probe ngắn hơn (15 ký tự)
+            probe2 = re.escape(sent[:15].strip())
+            m = re.search(probe2, content)
+        if not m:
+            continue
+
+        start = m.start()
+        # Ước tính end: tìm dấu câu kết thúc sau start
+        search_end = content[start: start + int(len(sent) * 1.5) + 50]
+        end_m = re.search(r'[.!?…](?:\s|$)', search_end)
+        if end_m:
+            end = start + end_m.end()
+        else:
+            end = start + len(sent)
+        end = min(end, len(content))
+
+        if end > start:
+            exact_spans.append((start, end))
+
+    if not exact_spans:
+        return escape(content)
+
+    # Sắp xếp và merge spans liền kề
+    exact_spans.sort()
+    merged = [list(exact_spans[0])]
+    for s, e in exact_spans[1:]:
+        if s <= merged[-1][1] + 10:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+
+    # Render HTML
+    result_parts = []
+    cursor = 0
+    for start, end in merged:
+        if start > cursor:
+            result_parts.append(escape(content[cursor:start]))
+        result_parts.append(
+            f"<mark style='background:linear-gradient(120deg,#FFD700 0%,#FFF176 100%);"
+            f"padding:2px 5px;border-radius:4px;font-weight:600;"
+            f"display:inline'>{escape(content[start:end])}</mark>"
         )
-    return safe
+        cursor = end
+
+    if cursor < len(content):
+        result_parts.append(escape(content[cursor:]))
+
+    return "".join(result_parts)
 
 
-def _render_sources(sources_data: list, question: str = "", key_prefix: str = ""):
+def _render_sources(sources_data: list, question: str = "", answer: str = "", key_prefix: str = ""):
     if not sources_data:
         return
     with st.expander(f"📄 Nguồn tham khảo ({len(sources_data)} đoạn)"):
@@ -177,7 +364,7 @@ def _render_sources(sources_data: list, question: str = "", key_prefix: str = ""
             if file_name and ('\\' in file_name or '/' in file_name):
                 file_name = file_name.replace('\\\\', '/').replace('\\', '/').split('/')[-1]
             st.markdown(f"**Đoạn {src['index']} — Trang {page_display}** · 📄 `{file_name}`")
-            highlighted = _highlight_text(src['content'], question) if question else \
+            highlighted = _highlight_text(src['content'], question, answer) if (question or answer) else \
                 src['content'].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             st.markdown(
                 f"<div style='background:#f8f9fa;border-left:3px solid #007BFF;"
@@ -448,11 +635,10 @@ if need_process:
 
         # Build Graph RAG nếu đang ở compare mode
         if st.session_state.compare_mode:
-            with st.spinner("Đang xây dựng Knowledge Graph..."):
-                st.session_state.graph = build_graph_rag(all_chunks)
-                node_count = st.session_state.graph.number_of_nodes()
-                edge_count = st.session_state.graph.number_of_edges()
-                st.success(f"Knowledge Graph: {node_count} nodes · {edge_count} edges")
+            st.session_state.graph = streamlit_build_graph_with_progress(all_chunks)
+            node_count = st.session_state.graph.number_of_nodes()
+            edge_count = st.session_state.graph.number_of_edges()
+            st.success(f"Knowledge Graph: {node_count} nodes · {edge_count} edges")
 
         del all_chunks
 
@@ -471,7 +657,7 @@ if (st.session_state.compare_mode
         and st.session_state.graph is None
         and st.session_state.chunks_store is not None):
     with st.spinner("Đang xây dựng Knowledge Graph từ tài liệu hiện tại..."):
-        st.session_state.graph = build_graph_rag(st.session_state.chunks_store)
+        st.session_state.graph = streamlit_build_graph_with_progress(st.session_state.chunks_store)
         node_count = st.session_state.graph.number_of_nodes()
         edge_count = st.session_state.graph.number_of_edges()
         st.success(f"Knowledge Graph: {node_count} nodes · {edge_count} edges")
@@ -521,7 +707,7 @@ if st.session_state.view_session and st.session_state.view_session != st.session
             with st.chat_message("assistant"):
                 st.write(a)
                 sources = json.loads(src_json) if src_json else []
-                _render_sources(sources, question=q)
+                _render_sources(sources, question=q, answer=a)
     else:
         st.warning("Không tìm thấy lịch sử cho session này.")
         st.session_state.view_session = None
@@ -544,6 +730,7 @@ else:
                     _render_sources(
                         json.loads(item.get("classic_sources", "[]")),
                         question=item["question"],
+                        answer=item.get("classic_answer", ""),
                         key_prefix=f"hist_classic_{item.get('timestamp','')}",
                     )
                 with col_r:
@@ -552,12 +739,13 @@ else:
                     _render_sources(
                         json.loads(item.get("graph_sources", "[]")),
                         question=item["question"],
+                        answer=item.get("graph_answer", ""),
                         key_prefix=f"hist_graph_{item.get('timestamp','')}",
                     )
             else:
                 st.write(item["answer"])
                 sources = json.loads(item["sources"]) if item.get("sources") else []
-                _render_sources(sources, question=item["question"])
+                _render_sources(sources, question=item["question"], answer=item.get("answer", ""))
 
     # Chat input
     if st.session_state.retriever is None:
@@ -614,7 +802,7 @@ else:
                                 # Render sources trong col_l
                                 with col_l:
                                     _render_sources(classic_sources, question=user_question,
-                                                    key_prefix="compare_classic")
+                                                    answer=classic_answer, key_prefix="compare_classic")
                                 continue
 
                             if token == "@@GRAPH_START@@":
@@ -627,7 +815,7 @@ else:
                                 graph_placeholder.markdown(graph_answer)
                                 with col_r:
                                     _render_sources(graph_sources, question=user_question,
-                                                    key_prefix="compare_graph")
+                                                    answer=graph_answer, key_prefix="compare_graph")
                                 continue
 
                             if token == "@@COMPARE_DONE@@":
@@ -639,7 +827,7 @@ else:
                                 classic_placeholder.markdown(classic_answer + "▌")
                             elif phase == "graph":
                                 graph_answer += token
-                                graph_placeholder.markdown(graph_answer + "▌")  # FIX: streaming Graph RAG
+                                graph_placeholder.markdown(graph_answer + "▌")  # streaming Graph RAG
 
                         # Lưu vào DB và session
                         combined_answer = (
@@ -697,7 +885,7 @@ else:
                             answer_placeholder.markdown(full_answer + "▌")
 
                         answer_placeholder.markdown(full_answer)
-                        _render_sources(sources_data, question=user_question)
+                        _render_sources(sources_data, question=user_question, answer=full_answer)
 
                         pdf_name = ", ".join(st.session_state.pdf_info["names"]) if st.session_state.pdf_info else None
                         save_message(st.session_state.session_id, pdf_name,
