@@ -155,9 +155,6 @@ def _highlight_text(content: str, question: str, answer: str = "") -> str:
     và câu trong chunk sẽ chia sẻ nhiều CỤM TỪ (bigram/trigram) giống nhau,
     dù không giống từng từ.
 
-    Vì sao tốt hơn bag-of-words:
-    - BOW: "Hồ Chí Minh" xuất hiện ở MỌI câu → mọi câu đều score cao
-    - N-gram: "gia đình nhà nho yêu nước" chỉ xuất hiện ở đúng đoạn nguồn
 
     Pipeline:
     1. Tách câu trong chunk thành danh sách câu hoàn chỉnh (≥ 40 ký tự)
@@ -484,9 +481,9 @@ with st.sidebar:
     st.divider()
 
     if _get_ollama_status():
-        st.success("🟢 Ollama đang chạy")
+        st.success("Ollama đang chạy")
     else:
-        st.error("🔴 Ollama chưa kết nối")
+        st.error("Ollama chưa kết nối")
         st.caption(f"Host: `{OLLAMA_HOST}`")
         if st.button("Kiểm tra lại"):
             st.session_state.ollama_ok = None

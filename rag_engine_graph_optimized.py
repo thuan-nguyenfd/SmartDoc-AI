@@ -286,9 +286,6 @@ def build_graph_rag_fast(
     return G
 
 
-# ══════════════════════════════════════════════════════════════
-# 5. TÍCH HỢP VÀO app.py — ví dụ sử dụng trong Streamlit
-# ══════════════════════════════════════════════════════════════
 
 def streamlit_build_graph_with_progress(chunks: list) -> nx.Graph:
     """
@@ -313,7 +310,7 @@ def streamlit_build_graph_with_progress(chunks: list) -> nx.Graph:
         st.success(f"Graph RAG: load từ cache ({cached.number_of_nodes()} nodes)")
         return cached
 
-    st.info(f"Đang build Knowledge Graph từ {total} chunks với {GRAPH_CONFIG['extraction_workers']} workers song song...")
+    st.info(f"Đang build Knowledge Graph")
     progress_bar = st.progress(0, text="Đang trích xuất thực thể...")
     status_text = st.empty()
 

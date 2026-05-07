@@ -126,7 +126,7 @@ def process_docx(file_path: str, embedder, chunk_size: int = None, chunk_overlap
     from langchain_community.document_loaders import Docx2txtLoader
     import docx
 
-    CHARS_PER_PAGE = 1000
+    CHARS_PER_PAGE = 2500
 
     loader = Docx2txtLoader(file_path)
     docs = loader.load()
